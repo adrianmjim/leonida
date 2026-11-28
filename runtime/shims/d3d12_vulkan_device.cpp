@@ -3036,6 +3036,53 @@ struct DeviceState {
     std::atomic<ULONGLONG> next_checkpoint{GetTickCount64() + 120000};
     std::atomic<unsigned> active_compiles{0};
 
+    // Pipeline layouts, one per distinct create info, shared by every PSO that asks for it (create_graphics and
+    // create_compute). A session makes ~50k PSOs from a handful of layout shapes, and a driver may copy the set
+    // layouts into every layout it makes (~2.3 KB each with the bindless set 0 on an RX 7900 XT): ~117 MB when each
+    // PSO made its own. The key is the whole create info, not a chosen part of it, so a create info that differs in
+    // anything gets its own layout. A PSO never destroys its layout: ~Device destroys them all, once every PSO, the
+    // compile workers and the GPU are done with them (destroy_pipeline_layouts).
+    std::mutex pipeline_layout_mutex;
+    std::map<std::vector<std::uint64_t>, VkPipelineLayout> pipeline_layouts;
+
+    // The device's layout for `create`, made on first use (PSOs are made on many threads). VK_NULL_HANDLE when the
+    // driver refuses it, or when `create` has a pNext chain, which the key does not describe.
+    VkPipelineLayout pipeline_layout(const VkPipelineLayoutCreateInfo& create) {
+        if (create.pNext) return VK_NULL_HANDLE;
+        std::vector<std::uint64_t> key;
+        key.reserve(2 + create.setLayoutCount + 1 + 2 * std::size_t(create.pushConstantRangeCount));
+        key.push_back(create.flags);
+        key.push_back(create.setLayoutCount);
+        for (std::uint32_t i = 0; i < create.setLayoutCount; ++i)
+            key.push_back(reinterpret_cast<std::uint64_t>(create.pSetLayouts[i]));
+        key.push_back(create.pushConstantRangeCount);
+        for (std::uint32_t i = 0; i < create.pushConstantRangeCount; ++i) {
+            const VkPushConstantRange& range = create.pPushConstantRanges[i];
+            key.push_back(std::uint64_t(range.stageFlags) << 32 | range.offset);
+            key.push_back(range.size);
+        }
+        std::lock_guard lock(pipeline_layout_mutex);
+        // The map entry first, then the layout: a layout made and then lost to a failed insert would be in no map,
+        // and destroy_pipeline_layouts would never free it.
+        const auto [it, inserted] = pipeline_layouts.try_emplace(std::move(key), VK_NULL_HANDLE);
+        if (!inserted) return it->second;
+        if (context->vk.vkCreatePipelineLayout(info.device, &create, nullptr, &it->second) != VK_SUCCESS) {
+            pipeline_layouts.erase(it);
+            return VK_NULL_HANDLE;
+        }
+        return it->second;
+    }
+    std::size_t pipeline_layout_count() {
+        std::lock_guard lock(pipeline_layout_mutex);
+        return pipeline_layouts.size();
+    }
+    void destroy_pipeline_layouts() {
+        std::lock_guard lock(pipeline_layout_mutex);
+        for (const auto& [key, layout] : pipeline_layouts)
+            context->vk.vkDestroyPipelineLayout(info.device, layout, nullptr);
+        pipeline_layouts.clear();
+    }
+
     VkPipelineCache pipeline_cache() {
         std::call_once(pipeline_cache_once, [this] {
             const auto& vk = context->vk;
@@ -12294,12 +12341,11 @@ public:
         PipelineCompiler::instance().cancel(compile_owner());  // nothing left in practice (last_release)
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
+        // The pipeline layouts are the device's, shared with other PSOs (DeviceState::pipeline_layout): kept.
         if (pipeline_.pipeline) vk.vkDestroyPipeline(dev, pipeline_.pipeline, nullptr);
-        if (pipeline_.layout) vk.vkDestroyPipelineLayout(dev, pipeline_.layout, nullptr);
         if (module_) vk.vkDestroyShaderModule(dev, module_, nullptr);
         if (graphics_.pipeline) vk.vkDestroyPipeline(dev, graphics_.pipeline, nullptr);
         for (const auto& [unbound, built] : variants_) vk.vkDestroyPipeline(dev, built, nullptr);
-        if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
         modules_.clear();
         if (code_bytes_) device_.code_copy_release(code_key_, code_base_, code_bytes_);
         --live_pipeline_state_count;
@@ -12558,7 +12604,6 @@ public:
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE* ms = nullptr,
                             const D3D12_SHADER_BYTECODE* as = nullptr, const StencilFaceMasks* back_masks = nullptr, bool depth_bounds = false) {
         auto& vk = device_.context->vk;
-        const VkDevice dev = device_.info.device;
         const bool mesh = ms && ms->pShaderBytecode && ms->BytecodeLength;
         if (as && as->pShaderBytecode && as->BytecodeLength) {
             return stream_unsupported("amplification shaders are not supported; stream subobject",
@@ -13309,7 +13354,8 @@ public:
             layout_info.pSetLayouts = &set0_layout;
             graphics_.bindless_set = device_.bindless->set();
         }
-        if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &graphics_.layout) != VK_SUCCESS) return E_FAIL;
+        graphics_.layout = device_.pipeline_layout(layout_info);
+        if (!graphics_.layout) return E_FAIL;
 
         // Kept for variants: a draw that leaves a slot unbound needs this pipeline with that format undefined.
         graphics_.mesh = mesh;
@@ -13405,8 +13451,6 @@ public:
     }
 
     HRESULT create_compute(const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc) {
-        auto& vk = device_.context->vk;
-        const VkDevice dev = device_.info.device;
         if (!desc.CS.pShaderBytecode || !desc.CS.BytecodeLength) return E_INVALIDARG;
         if (desc.NodeMask & ~1u) return E_INVALIDARG;
         if (static_cast<UINT>(desc.Flags) & ~kKnownPipelineStateFlags) return E_INVALIDARG;
@@ -13486,7 +13530,8 @@ public:
             layout_info.pSetLayouts = &set0_layout;
             pipeline_.bindless_set = device_.bindless->set();
         }
-        if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
+        pipeline_.layout = device_.pipeline_layout(layout_info);
+        if (!pipeline_.layout) return E_FAIL;
         compute_entry_ = entry;
         stage_bytes_ = spirv_bytes;
         pipeline_.estimate = leonida::large_module_estimate(spirv_bytes);
@@ -15820,13 +15865,15 @@ public:
                 std::snprintf(text, sizeof text,
                               "pipeline cache %.0f MiB; arena %.0f MiB (type %u), in use %.0f MiB (buffer %.0f, "
                               "descriptor heap %.0f, shader %.0f, heap %.0f), peak end %.0f MiB; title memory %llu "
-                              "ranges %.0f MiB reserved/committed VA; shadows %llu; fsdraw pipeline notes %zu",
+                              "ranges %.0f MiB reserved/committed VA; shadows %llu; fsdraw pipeline notes %zu; "
+                              "PSO pipeline layouts %zu",
                               leonida::mem_probe::mib(cache), leonida::mem_probe::mib(d.arena.size),
                               d.arena.memory_type, leonida::mem_probe::mib(in_use), leonida::mem_probe::mib(use[0]),
                               leonida::mem_probe::mib(use[1]), leonida::mem_probe::mib(use[2]),
                               leonida::mem_probe::mib(use[3]), leonida::mem_probe::mib(peak),
                               (unsigned long long)title_ranges, leonida::mem_probe::mib(title),
-                              (unsigned long long)shadows, leonida::fsdraw::pipeline_count());
+                              (unsigned long long)shadows, leonida::fsdraw::pipeline_count(),
+                              d.pipeline_layout_count());
                 return std::string(text);
             };
             facts.share = [this] {
@@ -16484,6 +16531,9 @@ public:
         }
         state_.staging_queue.reset();  // they use the context
         state_.staging_copy_queue.reset();
+        // The PSOs' shared layouts: every PSO is gone, the compiler and the pipeline workers have stopped, and the GPU
+        // is idle with the deferred deletions drained, so no pipeline, build or command buffer uses one any more.
+        if (state_.context) state_.destroy_pipeline_layouts();
         if (state_.context && state_.bindless) {
             // Every texture is gone by now (each held this device), and its views with it; samplers remain.
             std::lock_guard lock(state_.descriptor_mutex);
