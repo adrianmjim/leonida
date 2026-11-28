@@ -601,6 +601,24 @@ class TestReportErrors(unittest.TestCase):
             code = names_mod.main([source, "--mount", xml, "--out", out])
         return code, err.getvalue(), out
 
+    def test_duplicate_stream_locations_are_not_named_twice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            movie = stream(12, source="clips/one.rpf")
+            other = stream(12, source="clips/two.rpf")
+            index = self.write(tmp, "index.json", json.dumps({"streams": [other, movie]}))
+            self.assertEqual(len(names_mod.load_streams(index)), 2)
+            duplicate = dict(movie, source="clips\\one.rpf", frames=movie["frames"] + 1)
+            self.write(tmp, "index.json", json.dumps({"streams": [movie, other, duplicate]}))
+            output = self.write(tmp, "names.csv", "previous report")
+            xml = self.write(tmp, "list.xml", mount_xml(["a.bk2", "b.bk2", "c.bk2"]))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = names_mod.main([index, "--mount", xml, "--out", output])
+            self.assertEqual(rc, 1)
+            self.assertIn("duplicate stream location", err.getvalue())
+            with open(output, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "previous report")
+
     def test_bad_sources_are_rejected(self):
         # (extension, contents, expected error fragment or None to only require the path)
         cases = [

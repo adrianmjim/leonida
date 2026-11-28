@@ -185,6 +185,10 @@ def load_streams(source, skip_report=None):
         out[-1]["source"] = out[-1]["source"].replace("\\", "/")  # an older Windows index wrote "\"
     # A directory of carved files sorts by file name; carves name files by archive offset.
     out.sort(key=lambda r: (r["source"], r["offset"]))
+    for i in range(1, len(out)):
+        prev, curr = out[i - 1], out[i]
+        if prev["source"] == curr["source"] and prev["offset"] == curr["offset"]:
+            raise ValueError(f"duplicate stream location: {curr['source']} at offset {curr['offset']}")
     return out
 
 
