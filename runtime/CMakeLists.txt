@@ -3292,6 +3292,15 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_view_slices COMMAND d3d12_view_slices_test)
     set_tests_properties(d3d12_view_slices PROPERTIES SKIP_RETURN_CODE 77)
 
+    # The shared zero image of a placed BC texture's shape is released once no texture shows it
+    # (RT-ZERO-IMAGES-RELEASE).
+    add_executable(d3d12_zero_image_release_test test/d3d12_zero_image_release_test.cpp)
+    target_link_libraries(d3d12_zero_image_release_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_zero_image_release_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_zero_image_release_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_zero_image_release COMMAND d3d12_zero_image_release_test)
+    set_tests_properties(d3d12_zero_image_release PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
     # Typed RTV clears and draws of every TYPELESS color family against the host on the same adapter and WARP
     # (D3D-275). The draws need glslangValidator for their GLSL stand-ins of translated shaders.
     add_executable(d3d12_typeless_families_test test/d3d12_typeless_families_test.cpp)

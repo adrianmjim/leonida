@@ -7729,6 +7729,13 @@ struct DeviceState {
     std::map<ZeroShape, Resource*> zero_images;
     std::atomic<VkDeviceSize> zero_image_bytes{0};
     VkImage zero_sampled_image(const D3D12_RESOURCE_DESC&, const Format&, VkDeviceSize);
+    // How many placed textures show each shape's shared image (Resource::shared_zero_). The images sit in host
+    // memory on a discrete GPU and count against the 256 MiB, so one no texture shows any more is released
+    // (release_zero_image) rather than kept for the device's life. Taken before zero_image_mutex.
+    std::mutex zero_user_mutex;
+    std::map<ZeroShape, std::size_t> zero_image_users;  // under zero_user_mutex
+    VkImage acquire_zero_image(const D3D12_RESOURCE_DESC&, const Format&, VkDeviceSize);
+    void release_zero_image(const D3D12_RESOURCE_DESC&, VkImage);
     std::multimap<std::uint64_t, leonida::DescriptorKey> image_keys;  // by the texture's address
     std::vector<ImageEntry> replaced_images;  // kept until their texture goes: work in flight may still use them
     std::map<leonida::DescriptorKey, VkSampler> sampler_entries;
@@ -8948,6 +8955,10 @@ public:
         if (memory_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::device_memory, memory_);
         if (image_range_)
             device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_memory, image_range_.release());
+        // After forget_image: this texture's views of the shared image are queued for deletion before the image.
+        // Not when it got memory of its own: views of the shared image made before then may stay in
+        // replaced_images until this texture goes.
+        if (shared_zero_) device_.release_zero_image(desc_, shared_zero_);
     }
 
     VkDeviceAddress indexed_bda_{};
@@ -9707,7 +9718,7 @@ public:
             leonida::block_format(format.format, format.aspects).block > 1) {
             VkMemoryRequirements footprint{};
             if (device_.memory_requirements(info, footprint))
-                shared_zero_ = device_.zero_sampled_image(desc_, format, footprint.size);
+                shared_zero_ = device_.acquire_zero_image(desc_, format, footprint.size);
         }
         std::uint32_t plain_bits = 0;
         if (stage_title && (!shared_zero_ || no_host_copy) && allow_staged_title && origin != TitleImageOrigin::ordinary &&
@@ -9736,7 +9747,8 @@ public:
             image_ = VK_NULL_HANDLE;
             memory_ = VK_NULL_HANDLE;
             staged_title_ = false;
-            shared_zero_ = VK_NULL_HANDLE;
+            // No view of it was made yet; the retry below takes it again if it still fits.
+            if (shared_zero_) device_.release_zero_image(desc_, std::exchange(shared_zero_, VK_NULL_HANDLE));
             log_once("no room for a staged title image; retrying host-copyable backing, format", int(info.format));
             return create_texture(format, asked_castable, origin, false);
         };
@@ -10773,6 +10785,38 @@ VkImage DeviceState::zero_sampled_image(const D3D12_RESOURCE_DESC& d, const Form
     zero_images.emplace(key, zero);
     zero_image_bytes.fetch_add(zero->image_backing_bytes(), std::memory_order_relaxed);
     return zero->image();
+}
+
+// The shape's shared image for one more placed texture, which gives it back with release_zero_image.
+VkImage DeviceState::acquire_zero_image(const D3D12_RESOURCE_DESC& d, const Format& format, VkDeviceSize bytes) {
+    std::lock_guard lock(zero_user_mutex);  // a release of the shape's last user cannot run between the two
+    const VkImage image = zero_sampled_image(d, format, bytes);
+    if (image) ++zero_image_users[ZeroShape{d.Format, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels}];
+    return image;
+}
+
+// A placed texture no longer shows the shared image of its shape. With no other user the image leaves the map and its
+// bytes leave the 256 MiB; the Resource's own destructor queues it for deletion after the submissions made so far, as
+// the views of it queued before. The shapes left without an image because they did not fit get another try too.
+void DeviceState::release_zero_image(const D3D12_RESOURCE_DESC& d, VkImage image) {
+    const ZeroShape key{d.Format, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels};
+    Resource* gone = nullptr;
+    {
+        std::lock_guard users_lock(zero_user_mutex);
+        const auto users = zero_image_users.find(key);
+        if (users == zero_image_users.end() || --users->second) return;
+        zero_image_users.erase(users);
+        std::lock_guard lock(zero_image_mutex);
+        const auto it = zero_images.find(key);
+        if (it == zero_images.end() || !it->second || it->second->image() != image) return;
+        gone = it->second;
+        zero_images.erase(it);
+        zero_image_bytes.fetch_sub(gone->image_backing_bytes(), std::memory_order_relaxed);
+        // Each entry with an image has a user: more entries than users means some shapes were left without one.
+        if (zero_images.size() > zero_image_users.size())
+            std::erase_if(zero_images, [](const auto& entry) { return !entry.second; });
+    }
+    gone->Release();  // outside the locks: its destructor takes the descriptor and context locks
 }
 
 
@@ -22250,6 +22294,19 @@ ImageMemoryStats image_memory_stats(ID3D12Device* device) {
     if (!d || !d->state().image_memory) return {};
     const auto stats = d->state().image_memory->stats();
     return {stats.blocks, stats.block_bytes, stats.ranges};
+}
+
+SharedZeroImages shared_zero_images(ID3D12Device* device) {
+    if (!device) return {};
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    auto* d = Device::from<Device>(real ? real : device);
+    if (!d) return {};
+    auto& state = d->state();
+    SharedZeroImages out;
+    std::lock_guard lock(state.zero_image_mutex);
+    for (const auto& [shape, image] : state.zero_images) out.images += image != nullptr;
+    out.bytes = state.zero_image_bytes.load(std::memory_order_relaxed);
+    return out;
 }
 
 bool read_arena(ID3D12Device* device, std::uint64_t va, void* out, std::size_t bytes) {
