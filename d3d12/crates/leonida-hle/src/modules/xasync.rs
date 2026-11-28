@@ -859,15 +859,16 @@ pub fn pending_with(
             // once per call.
             OP_CLEANUP => drop(unsafe { Arc::from_raw(state) }),
             OP_BEGIN => {
-                // The call was filed under the block before its begin.
-                let Some(call) = call(data.block) else {
+                // SAFETY: `pending_with` added this reference for the begin
+                // to take, so it holds even if the call is already over.
+                let state = unsafe { Arc::from_raw(state) };
+                // The call was filed under the block before its begin, but a
+                // cancel from another thread may already have ended it, and
+                // the block may hold another call by now. While `state` lives,
+                // no other call's context can have its address.
+                let current = call(data.block);
+                let Some(call) = current.filter(|c| c.context == data.context as usize) else {
                     return E_ABORT;
-                };
-                // SAFETY: as above; the call is not cleaned up before its
-                // begin returns, so the call's reference is still held.
-                let state = unsafe {
-                    Arc::increment_strong_count(state);
-                    Arc::from_raw(state)
                 };
                 let work = lock(&state).0.take();
                 let block = data.block as usize;
@@ -897,6 +898,12 @@ pub fn pending_with(
     }
     let state: Arc<Data> = Arc::new(Mutex::new((Some(Box::new(work)), Vec::new())));
     let context = Arc::into_raw(state);
+    // Two references go with the context: the call's, which cleanup drops,
+    // and the thread's, which the begin takes. Added in the begin instead,
+    // it could come after a cancel from another thread had cleaned the call
+    // up and dropped the state.
+    // SAFETY: from `Arc::into_raw` just above.
+    unsafe { Arc::increment_strong_count(context) };
     let hr = XAsyncBegin(
         block,
         context.cast_mut().cast(),
@@ -905,8 +912,12 @@ pub fn pending_with(
         Some(provider),
     );
     if hr < 0 {
-        // SAFETY: refused before the call existed; still ours.
-        drop(unsafe { Arc::from_raw(context) });
+        // SAFETY: refused before the call existed or its begin ran, so both
+        // references are still ours.
+        unsafe {
+            Arc::decrement_strong_count(context);
+            drop(Arc::from_raw(context));
+        }
     }
     hr
 }
