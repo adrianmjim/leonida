@@ -20,11 +20,10 @@
 //!    translation are never loaded again (their names hash the old code),
 //!    yet they were kept: every save wrote the whole library back, so the
 //!    file (and what the host reads of it) only grew with each translator
-//!    change. A save
-//!    deletes the fingerprint before it renames a library of other shaders
-//!    over the file and writes the new one after, so a save cut short
-//!    leaves no fingerprint (an empty library next start), never a stale
-//!    library under the current fingerprint.
+//!    change. A save deletes the fingerprint before it renames a library
+//!    of other shaders over the file and writes the new one after, so a
+//!    save cut short leaves no fingerprint (an empty library next start),
+//!    never a stale library under the current fingerprint.
 //! 2. The title pipelines a run drew or dispatched with are listed by a key
 //!    known when the title creates them (their shader containers and
 //!    graphics state); the next run hands those to the workers at
@@ -235,7 +234,12 @@ impl Blob {
         }
         // The fingerprint is that of the library the next start opens: of
         // the waiting one while it is still there, so the older file under
-        // the name is not taken for it.
+        // the name is not taken for it. That file may be of the shaders
+        // before them (a save that started empty and could not replace it
+        // left the waiting one), so even under this run's fingerprint it is
+        // not opened: the run starts empty, and its first save replaces a
+        // library of these shaders with what it made. Pipelines to compile
+        // again, once, rather than stale ones kept for good.
         let stored = if next.exists() {
             None
         } else {
@@ -800,13 +804,18 @@ fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Res
 }
 
 /// As [`replace_library`], for a library made for the shaders with the
-/// fingerprint `current` ([`shaders`]). When [`FINGERPRINT_FILE`] holds another (this run started
-/// empty), it is deleted before the rename and written after: a save cut
-/// short in between leaves a library with no fingerprint, which the next
-/// start does not open. Written first, a crash before the rename would
-/// leave the old library under this fingerprint, and every later save
-/// would keep its stale pipelines.
+/// fingerprint `current` ([`shaders`]). When [`FINGERPRINT_FILE`] holds
+/// another (this run started empty), it is deleted before the rename and
+/// written after: a save cut short in between leaves a library with no
+/// fingerprint, which the next start does not open. Written first, a crash
+/// before the rename would leave the old library under this fingerprint,
+/// and every later save would keep its stale pipelines.
 fn replace_library_for(dir: &std::path::Path, tmp: &std::path::Path, current: &str) -> std::io::Result<()> {
+    // A worker save and the shutdown save may overlap: one could delete the
+    // fingerprint the other just wrote and then fail its rename, and the
+    // next start would compile everything again.
+    static REPLACING: Mutex<()> = Mutex::new(());
+    let _guard = REPLACING.lock().unwrap_or_else(|e| e.into_inner());
     let noted = dir.join(FINGERPRINT_FILE);
     let same = reuse_blob(std::fs::read_to_string(&noted).ok().as_deref(), current);
     if !same {
