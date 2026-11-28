@@ -149,4 +149,20 @@ inline bool session_holds_seed(const std::optional<SessionSeed>& recorded, const
            recorded->session_bytes == session_bytes && session_bytes >= seed.bytes;
 }
 
+// Where a device's shared cache came from: the offline seed it holds (zero for none) and the size of the blob it was
+// created from, the seed itself or a session file that holds it.
+struct CacheOrigin {
+    SeedStamp seed;
+    std::uint64_t loaded_bytes = 0;
+};
+
+// Whether a session file of `written` bytes, written back from a cache of `origin`, may be recorded as holding the
+// seed. Not without a seed, and not when it is smaller than the seed or than the blob the cache was created from: the
+// driver's union of a cache it was given does not shrink, so a smaller one lost entries on the way (a damaged file
+// the driver took only part of). Recorded, that loss would be carried to every later launch, because the seed would
+// not be loaded again to put the entries back; without a record the next launch loads the seed and merges.
+inline bool may_record_session_seed(const CacheOrigin& origin, std::uint64_t written) {
+    return origin.seed.bytes && written >= origin.seed.bytes && written >= origin.loaded_bytes;
+}
+
 }  // namespace leonida::pipeline_cache_store

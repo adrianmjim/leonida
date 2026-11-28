@@ -21,8 +21,8 @@
 // After each case the compiler's thread is gone and the process's thread count is back where it was.
 // --seed instead runs the session file beside an offline seed (seeded_session): a session file written beside the
 // seed there now, as pipeline_cache.session.seed records, is loaded alone, the seed not read and nothing merged, and
-// its pipelines are cache hits; a touched seed, no seed, no record, LEONIDA_PIPELINE_CACHE_BYTES=0 and
-// LEONIDA_SESSION_CACHE_DIRECT_SEED=0 behave as before.
+// its pipelines, the seed's among them, are cache hits; a touched seed, no seed, no record,
+// LEONIDA_PIPELINE_CACHE_BYTES=0 and LEONIDA_SESSION_CACHE_DIRECT_SEED=0 behave as before.
 // No game data: the shader is test/glsl/cs_user_data.comp, the programs are made-up FSSM bytes.
 #include "shader_fixture_path.h"
 #include "test_temp_dir.h"
@@ -505,38 +505,45 @@ leonida::pipeline_cache_store::SeedStamp stamp_of(const std::filesystem::path& p
             (std::uint64_t(about.ftLastWriteTime.dwHighDateTime) << 32) | about.ftLastWriteTime.dwLowDateTime};
 }
 
+// --seed: program 1's pipeline told apart from program 0's, which all programs share otherwise (the same SPIR-V, the
+// same layout): the same SPIR-V with a 32-wide workgroup instead of 64, which no driver can take for the other.
+bool narrow_workgroup(const std::filesystem::path& path) {
+    std::vector<char> bytes = read_bytes(path);
+    if (bytes.size() < 20 || bytes.size() % 4) return false;
+    std::vector<std::uint32_t> words(bytes.size() / 4);
+    std::memcpy(words.data(), bytes.data(), bytes.size());
+    if (words[0] != 0x07230203u) return false;
+    bool narrowed = false;
+    for (std::size_t i = 5; i < words.size();) {
+        const std::uint32_t count = words[i] >> 16, opcode = words[i] & 0xffffu;
+        if (!count || count > words.size() - i) return false;
+        // OpExecutionMode %main LocalSize 64 1 1
+        if (opcode == 16 && count == 6 && words[i + 2] == 17 && words[i + 3] == 64) {
+            words[i + 3] = 32;
+            narrowed = true;
+        }
+        i += count;
+    }
+    if (!narrowed) return false;
+    std::memcpy(bytes.data(), words.data(), bytes.size());
+    return write_bytes(path, bytes);
+}
+
 // --seed: pipeline_cache.session.bin beside an offline pipeline_cache.bin, and the record of which seed it was
-// written beside (pipeline_cache.session.seed). The journal is off, so a round's compute build goes into the shared
-// cache and the session file is its only copy. The seed is an empty cache of this device. Each round opens a device,
-// builds one PSO (always the same pipeline), tears the device down, which writes the session file, and reports the
-// device's merges, the blobs it created caches from and whether the build was a cache hit.
+// written beside (pipeline_cache.session.seed). The journal is off, so a round's compute builds go into the shared
+// cache and the session file is their only copy. The seed holds a real pipeline, program 0's, made by a first round
+// with no seed; program 1 (a 32-wide workgroup, narrow_workgroup) is in no seed. Each round opens a device, builds
+// the PSOs, tears the device down, which writes the session file, and reports the device's merges, the blobs it
+// created caches from and how many builds were cache hits (pipeline creation feedback). A session file loaded alone
+// that lacked the seed's pipeline would miss program 0.
 int seeded_session(vktest::Device& d, const std::filesystem::path& library, const std::filesystem::path& cache_dir) {
     namespace store = leonida::pipeline_cache_store;
     const auto seed_file = cache_dir / "pipeline_cache.bin";
     const auto session_file = cache_dir / "pipeline_cache.session.bin";
     const auto record_file = cache_dir / "pipeline_cache.session.seed";
-    std::vector<char> seed;
-    {
-        const auto create = reinterpret_cast<PFN_vkCreatePipelineCache>(d.device_proc(d.device, "vkCreatePipelineCache"));
-        const auto destroy = reinterpret_cast<PFN_vkDestroyPipelineCache>(d.device_proc(d.device, "vkDestroyPipelineCache"));
-        const auto data = reinterpret_cast<PFN_vkGetPipelineCacheData>(d.device_proc(d.device, "vkGetPipelineCacheData"));
-        EXPECT(create && destroy && data);
-        const VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-        VkPipelineCache cache = VK_NULL_HANDLE;
-        EXPECT(create(d.device, &info, nullptr, &cache) == VK_SUCCESS);
-        std::size_t size = 0;
-        const bool sized = data(d.device, cache, &size, nullptr) == VK_SUCCESS;
-        seed.resize(size);
-        const bool read = sized && data(d.device, cache, &size, seed.data()) == VK_SUCCESS;
-        destroy(d.device, cache, nullptr);
-        EXPECT(read && size >= store::header_bytes);
-        seed.resize(size);
-    }
     std::error_code ec;
     std::filesystem::create_directories(cache_dir, ec);
     for (const auto& file : {seed_file, session_file, record_file}) std::filesystem::remove(file, ec);
-    EXPECT(write_bytes(seed_file, seed));
-    const std::size_t seed_bytes = seed.size();
     using Sizes = std::vector<std::size_t>;
 
     struct Result {
@@ -545,14 +552,15 @@ int seeded_session(vktest::Device& d, const std::filesystem::path& library, cons
         std::vector<char> session;                 // the session file after teardown; empty when there is none
         bool recorded = false;                     // a pipeline_cache.session.seed after teardown
         std::optional<store::SessionSeed> record;  // and what it says
+        unsigned misses() const { return builds - hits; }
     };
-    const auto round = [&](const char* name, Result& result) -> int {
+    const auto round = [&](const char* name, unsigned programs, Result& result) -> int {
         cache_calls.reset();
         Session s;
         s.count_cache_calls = true;
-        if (s.open(d, library, 1)) return 1;
+        if (s.open(d, library, programs)) return 1;
         EXPECT(drain(PipelineCompiler::instance()));
-        EXPECT(built(s.psos[0]));
+        for (ID3D12PipelineState* pso : s.psos) EXPECT(built(pso));
         s.release();
         result.merges = cache_calls.merges.load();
         result.builds = cache_calls.builds.load();
@@ -573,30 +581,48 @@ int seeded_session(vktest::Device& d, const std::filesystem::path& library, cons
                     "then a %zu-byte session file, %s\n", name, result.merges, loads.c_str(), result.hits,
                     result.builds, result.session.size(),
                     !result.recorded ? "no record" : result.record ? "a record" : "an UNREADABLE record");
+        EXPECT(result.builds >= programs);
         return 0;
     };
     const auto records = [&](const Result& result) {
         return result.record && result.record->seed == stamp_of(seed_file) &&
                result.record->session_bytes == result.session.size();
     };
-    std::printf("seed: the seed is an empty cache of %zu bytes\n", seed_bytes);
 
-    // 1. The seed alone: loaded, the pipeline built (no hit), the session file written with a record of the seed.
+    // 0. The seed: program 0 built with no seed and no session file, and the session file that teardown writes moved
+    // to pipeline_cache.bin.
+    Result making;
+    if (round("making the seed (no seed, no session file, program 0)", 1, making)) return 1;
+    EXPECT(making.merges == 0 && making.loads.empty() && !making.recorded);
+    EXPECT(making.session.size() > store::header_bytes);
+    std::filesystem::rename(session_file, seed_file, ec);
+    EXPECT(!ec);
+    const std::vector<char> seed = read_bytes(seed_file);
+    const std::size_t seed_bytes = seed.size();
+    EXPECT(seed_bytes == making.session.size());
+    std::printf("seed: the seed is %zu bytes, program 0's pipeline\n", seed_bytes);
+
+    // 1. The seed alone: loaded; program 0 a hit from it, program 1 built; the session file written with a record of
+    // the seed. A driver that never reports a hit to pipeline creation feedback here gets the size checks instead.
     Result first;
-    if (round("seed, no session file", first)) return 1;
+    if (round("seed, no session file", 2, first)) return 1;
     EXPECT(first.merges == 0);
     EXPECT(first.loads == Sizes{seed_bytes});
-    EXPECT(first.builds >= 1 && first.hits == 0);
+    const bool feedback = first.hits >= 1;
+    if (!feedback)
+        std::printf("seed: the driver reported no cache hit for the seed's pipeline; hits not checked, session file "
+                    "sizes instead\n");
+    EXPECT(!feedback || first.misses() == 1);  // program 1 only
     EXPECT(first.session.size() > seed_bytes);
 
     // 2. Relaunch: the session file, which holds the seed, is the cache. The seed is not read, nothing is merged, and
-    // the pipeline from round 1 is a cache hit.
+    // both pipelines are cache hits: program 0's, which came from the seed, and program 1's from round 1.
     Result direct;
-    if (round("relaunch", direct)) return 1;
+    if (round("relaunch", 2, direct)) return 1;
     EXPECT(direct.merges == 0);  // before pipeline_cache.session.seed: the session file merged into the seed, 1
     EXPECT(records(first));
     EXPECT(direct.loads == Sizes{first.session.size()});
-    EXPECT(direct.hits >= 1);
+    EXPECT(feedback ? direct.misses() == 0 : direct.session.size() >= first.session.size());
     EXPECT(records(direct));
 
     // 3. The seed touched (a new corpus build): the seed is loaded and the session file merged, as before; the record
@@ -604,47 +630,60 @@ int seeded_session(vktest::Device& d, const std::filesystem::path& library, cons
     std::filesystem::last_write_time(seed_file, std::filesystem::last_write_time(seed_file) + std::chrono::hours(1), ec);
     EXPECT(!ec && stamp_of(seed_file) != direct.record->seed);
     Result touched;
-    if (round("the seed touched", touched)) return 1;
+    if (round("the seed touched", 2, touched)) return 1;
     EXPECT(touched.merges == 1);
     EXPECT(touched.loads == (Sizes{seed_bytes, direct.session.size()}));
-    EXPECT(touched.hits >= 1);
+    EXPECT(!feedback || touched.misses() == 0);
     EXPECT(records(touched));
     Result again;
-    if (round("relaunch after the touch", again)) return 1;
-    EXPECT(again.merges == 0 && again.loads == Sizes{touched.session.size()} && again.hits >= 1);
+    if (round("relaunch after the touch", 2, again)) return 1;
+    EXPECT(again.merges == 0 && again.loads == Sizes{touched.session.size()});
+    EXPECT(!feedback || again.misses() == 0);
+    EXPECT(records(again));
 
-    // 4. No seed: the session file initializes the cache directly, as before, and the session file written without a
-    // seed removes the record.
-    std::filesystem::remove(seed_file, ec);
-    Result unseeded;
-    if (round("no seed", unseeded)) return 1;
-    EXPECT(unseeded.merges == 0 && unseeded.loads == Sizes{again.session.size()} && unseeded.hits >= 1);
-    EXPECT(!unseeded.session.empty() && !unseeded.recorded);
-
-    // 5. LEONIDA_PIPELINE_CACHE_BYTES=0 with the seed back: the seed alone, the session file neither read nor
-    // written, and no record.
-    EXPECT(write_bytes(seed_file, seed));
+    // 4. LEONIDA_PIPELINE_CACHE_BYTES=0 with a record that matches: the seed alone (program 1, which only the session
+    // file has, built again), the session file neither read nor written, and the record left as it was.
+    const auto session_before = stamp_of(session_file);
+    const auto record_before = stamp_of(record_file);
+    const auto record_text = read_bytes(record_file);
     _putenv_s("LEONIDA_PIPELINE_CACHE_BYTES", "0");
     Result off;
-    int failed = round("LEONIDA_PIPELINE_CACHE_BYTES=0", off);
+    int failed = round("LEONIDA_PIPELINE_CACHE_BYTES=0", 2, off);
     _putenv_s("LEONIDA_PIPELINE_CACHE_BYTES", "67108864");
     if (failed) return 1;
     EXPECT(off.merges == 0 && off.loads == Sizes{seed_bytes});
-    EXPECT(off.session == unseeded.session && !off.recorded);
+    EXPECT(!feedback || off.misses() == 1);
+    EXPECT(off.session == again.session && stamp_of(session_file) == session_before);
+    EXPECT(read_bytes(record_file) == record_text && stamp_of(record_file) == record_before);
 
-    // 6. A seed and a session file with no record: the seed loaded and the session file merged, as before, and the
-    // record written. Then LEONIDA_SESSION_CACHE_DIRECT_SEED=0: the same, although the record matches.
-    Result unrecorded;
-    if (round("seed and session file, no record", unrecorded)) return 1;
-    EXPECT(unrecorded.merges == 1 && unrecorded.loads == (Sizes{seed_bytes, off.session.size()}));
-    EXPECT(unrecorded.hits >= 1 && records(unrecorded));
+    // 5. LEONIDA_SESSION_CACHE_DIRECT_SEED=0 with a record that matches: the seed loaded and the session file merged,
+    // as before, and the record written.
     _putenv_s("LEONIDA_SESSION_CACHE_DIRECT_SEED", "0");
     Result switched;
-    failed = round("LEONIDA_SESSION_CACHE_DIRECT_SEED=0", switched);
+    failed = round("LEONIDA_SESSION_CACHE_DIRECT_SEED=0", 2, switched);
     _putenv_s("LEONIDA_SESSION_CACHE_DIRECT_SEED", "");
     if (failed) return 1;
-    EXPECT(switched.merges == 1 && switched.loads == (Sizes{seed_bytes, unrecorded.session.size()}));
-    EXPECT(switched.hits >= 1 && records(switched));
+    EXPECT(switched.merges == 1 && switched.loads == (Sizes{seed_bytes, again.session.size()}));
+    EXPECT(!feedback || switched.misses() == 0);
+    EXPECT(records(switched));
+
+    // 6. No seed: the session file initializes the cache directly, as before, and the session file written without a
+    // seed removes the record.
+    std::filesystem::remove(seed_file, ec);
+    Result unseeded;
+    if (round("no seed", 2, unseeded)) return 1;
+    EXPECT(unseeded.merges == 0 && unseeded.loads == Sizes{switched.session.size()});
+    EXPECT(!feedback || unseeded.misses() == 0);
+    EXPECT(!unseeded.session.empty() && !unseeded.recorded);
+
+    // 7. The seed back, beside a session file with no record: the seed loaded and the session file merged, as before,
+    // and the record written.
+    EXPECT(write_bytes(seed_file, seed));
+    Result unrecorded;
+    if (round("seed and session file, no record", 2, unrecorded)) return 1;
+    EXPECT(unrecorded.merges == 1 && unrecorded.loads == (Sizes{seed_bytes, unseeded.session.size()}));
+    EXPECT(!feedback || unrecorded.misses() == 0);
+    EXPECT(records(unrecorded));
     std::printf("ok\n");
     return 0;
 }
@@ -690,9 +729,12 @@ int main(int argc, char** argv) {
         for (unsigned i = 0; i < kPrograms; ++i) {
             const std::string name = "cs_teardown_" + std::to_string(i);
             EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV), library / (name + ".spv")));
+            const bool narrow = seed_mode && i == 1;  // a pipeline of its own (seeded_session)
+            if (narrow) EXPECT(narrow_workgroup(library / (name + ".spv")));
             index << (i ? ",\n" : "") << "\"" << name << "\": {\"stage\": \"cs\", \"fssm_sha256\": \""
                   << leonida::sha256_hex(program(i)) << "\", \"bindings\": [], \"push_constant_bytes\": 144, "
-                  << "\"local_size\": [64, 1, 1], \"uses_code_base\": true, \"wave64\": false}";
+                  << "\"local_size\": [" << (narrow ? 32 : 64) << ", 1, 1], \"uses_code_base\": true, "
+                  << "\"wave64\": false}";
         }
         index << "}";
     }

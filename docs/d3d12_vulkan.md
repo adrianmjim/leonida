@@ -2768,10 +2768,14 @@ Pipeline creation:
   launch, when the record matches the `pipeline_cache.bin` there now, the session file still has the size recorded and
   is at least the seed's size, and its header names this device, the cache is created from the session file alone:
   `pipeline_cache.bin` is not read and nothing is merged (one line says so; the save limit still counts what a session
-  adds to the seed). A new or touched seed, a missing or damaged record, a session file another build wrote since, or a
-  blob the driver declines falls back to loading the seed and merging the session file into it. Nothing is skipped or
-  deleted but a stale record. `LEONIDA_SESSION_CACHE_DIRECT_SEED=0` always loads the seed and merges (the record is
-  still written); with `LEONIDA_PIPELINE_CACHE_BYTES=0` neither file is read or written.
+  adds to the seed). A new or touched seed, a missing or damaged record, a session file whose size differs from the
+  record (another build wrote it since), or a blob the driver declines falls back to loading the seed and merging the
+  session file into it. A session file written back smaller than the blob its cache was created from removes the
+  record instead of writing it (`may_record_session_seed`): the driver's union does not shrink, so entries were lost on
+  the way, and the next launch loads the seed again to put them back. Nothing is skipped or deleted but a stale
+  record. `LEONIDA_SESSION_CACHE_DIRECT_SEED=0`, or `LEONIDA_DIRECT_SESSION_CACHE=0`, always loads the seed and merges
+  (the record is still written); with `LEONIDA_PIPELINE_CACHE_BYTES=0`, `pipeline_cache.session.bin` and
+  `pipeline_cache.session.seed` are neither read nor written (the seed still loads).
   The session file can't keep a crashed run's compiles: it is written at teardown and at the optional checkpoints
   below only. The heavy pipeline cache (RT-HEAVY-PIPELINE-CACHE, `runtime/src/heavy_pipeline_cache.h`) keeps the graphics ones; compute pipelines go to the per-pipeline journal
   described below. Every graphics build first asks the corpus cache with

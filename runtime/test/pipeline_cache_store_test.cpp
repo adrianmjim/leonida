@@ -157,6 +157,24 @@ static int test_session_seed() {
     std::string flipped = text;
     flipped[flipped.find("seed_time ") + 10] = '\x01';
     CHECK(!store::parse_session_seed(flipped));
+
+    // Whether the session file just written may be recorded. From the seed itself: anything at least the seed's size.
+    const store::CacheOrigin from_seed{seed, seed.bytes};
+    CHECK(store::may_record_session_seed(from_seed, seed.bytes));
+    CHECK(store::may_record_session_seed(from_seed, recorded.session_bytes));
+    CHECK(!store::may_record_session_seed(from_seed, seed.bytes - 1));
+    // From a session file that holds the seed: a write-back smaller than that file lost entries (a damaged blob the
+    // driver took only part of), even when it is still larger than the seed, so it is not recorded and the next
+    // launch merges the seed again.
+    const store::CacheOrigin from_session{seed, recorded.session_bytes};
+    CHECK(store::may_record_session_seed(from_session, recorded.session_bytes));
+    CHECK(store::may_record_session_seed(from_session, recorded.session_bytes + 4096));
+    CHECK(!store::may_record_session_seed(from_session, recorded.session_bytes - 1));
+    CHECK(!store::may_record_session_seed(from_session, seed.bytes + 1));
+    CHECK(!store::may_record_session_seed(from_session, 0));
+    // No seed: never recorded, whatever the sizes.
+    CHECK(!store::may_record_session_seed({}, recorded.session_bytes));
+    CHECK(!store::may_record_session_seed({{}, 64}, recorded.session_bytes));
     return 0;
 }
 
