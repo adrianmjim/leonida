@@ -11,7 +11,10 @@
 //     placements had a shader-resource view, which is a view of the shared image, sampled by nothing but alive).
 //   - A placement of a shape seen before gets a shared image again. Once a copy into it gives it memory of its own,
 //     its shape's image goes while the texture lives on: after the next submission no shared image or byte is left,
-//     and the image is destroyed after the views of it.
+//     and the image is destroyed after the views of it. That copy's replay on the direct queue gives the claim back
+//     in its prepare and submits later: a compute queue's replay begun meanwhile (from inside the copy's
+//     vkEndCommandBuffer) must not release the image before the copy's replay has recorded its submission, or the
+//     image's deferred deletion would be due once the compute queue's submission completes, with the copy's pending.
 //   - Shapes placed until one does not fit in the 256 MiB: once one of them is released, the one that did not fit
 //     gets an image.
 // The device has no host image copies, so a placement takes the shared image whatever its driver allows for host-copy
@@ -20,11 +23,14 @@
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <map>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -63,6 +69,36 @@ std::set<UINT> widths_seen;     // shapes that had an image made
 std::set<VkImage> shared_live;  // shared images made and not destroyed yet
 std::map<VkImageView, VkImage> shared_views;  // views of those, not destroyed yet
 unsigned shared_made = 0, shared_destroyed = 0, views_made = 0, destroyed_under_view = 0;
+
+// A placement waiting on the shared zero image has no memory of its own yet.
+bool shared(ID3D12Resource* texture) { return !rt::d3d12::vulkan_memory_flags(texture); }
+
+// The copy's replay ending its command buffer, after its prepare gave the texture memory of its own (and gave its
+// claim back), starts the other queue's replay and watches for up to half a second whether the shape's image is
+// released meanwhile: its own submission is not recorded yet.
+PFN_vkEndCommandBuffer real_end_command_buffer = nullptr;
+std::atomic<ID3D12Resource*> copy_target{nullptr};  // armed: the texture the copy gives memory of its own
+ID3D12Device* hook_device = nullptr;
+ID3D12CommandQueue* other_queue = nullptr;
+ID3D12CommandList* other_list = nullptr;
+std::thread other_replay;
+bool released_during_copy = false;
+
+VKAPI_ATTR VkResult VKAPI_CALL end_command_buffer(VkCommandBuffer command_buffer) {
+    ID3D12Resource* texture = copy_target.load();
+    if (texture && !shared(texture) && copy_target.compare_exchange_strong(texture, nullptr)) {
+        other_replay = std::thread([] {
+            ID3D12CommandList* lists[] = {other_list};
+            other_queue->ExecuteCommandLists(1, lists);
+        });
+        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (std::chrono::steady_clock::now() < until && !released_during_copy) {
+            released_during_copy = rt::d3d12::shared_zero_images(hook_device).images == 0;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    return real_end_command_buffer(command_buffer);
+}
 
 VKAPI_ATTR VkResult VKAPI_CALL create_image(VkDevice device, const VkImageCreateInfo* info,
                                             const VkAllocationCallbacks* allocator, VkImage* image) {
@@ -126,6 +162,10 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL device_proc(VkDevice device, const char
         real_destroy_view = reinterpret_cast<PFN_vkDestroyImageView>(real_device_proc(device, name));
         return real_destroy_view ? reinterpret_cast<PFN_vkVoidFunction>(&destroy_view) : nullptr;
     }
+    if (std::strcmp(name, "vkEndCommandBuffer") == 0) {
+        real_end_command_buffer = reinterpret_cast<PFN_vkEndCommandBuffer>(real_device_proc(device, name));
+        return real_end_command_buffer ? reinterpret_cast<PFN_vkVoidFunction>(&end_command_buffer) : nullptr;
+    }
     return real_device_proc(device, name);
 }
 
@@ -147,9 +187,6 @@ D3D12_RESOURCE_DESC bc1(UINT w, UINT h) {
     desc.Format = DXGI_FORMAT_BC1_UNORM;
     return desc;
 }
-
-// A placement waiting on the shared zero image has no memory of its own yet.
-bool shared(ID3D12Resource* texture) { return !rt::d3d12::vulkan_memory_flags(texture); }
 
 }  // namespace
 
@@ -189,6 +226,9 @@ int main() {
         Ref<ID3D12CommandAllocator> allocator;
         Ref<ID3D12GraphicsCommandList> list;
         Ref<ID3D12Fence> fence;
+        Ref<ID3D12CommandQueue> compute_queue;  // the other queue, with an empty list
+        Ref<ID3D12CommandAllocator> compute_allocator;
+        Ref<ID3D12GraphicsCommandList> compute_list;
         UINT64 round = 0;
         // One list with what `record` puts in it, run to completion.
         const auto submit = [&](auto&& record) {
@@ -220,6 +260,17 @@ int main() {
                                                        IID_PPV_ARGS(&list.p))));
             EXPECT(list->Close() == S_OK);
             EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+            D3D12_COMMAND_QUEUE_DESC compute_desc{};
+            compute_desc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+            EXPECT(SUCCEEDED(device->CreateCommandQueue(&compute_desc, IID_PPV_ARGS(&compute_queue.p))));
+            EXPECT(SUCCEEDED(device->CreateCommandAllocator(compute_desc.Type,
+                                                            IID_PPV_ARGS(&compute_allocator.p))));
+            EXPECT(SUCCEEDED(device->CreateCommandList(0, compute_desc.Type, compute_allocator.p, nullptr,
+                                                       IID_PPV_ARGS(&compute_list.p))));
+            EXPECT(compute_list->Close() == S_OK);
+            hook_device = device.p;
+            other_queue = compute_queue.p;
+            other_list = compute_list.p;
             D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
             heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
             heap_desc.NumDescriptors = 4;
@@ -312,7 +363,8 @@ int main() {
             EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &buffer,
                                                              D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                              IID_PPV_ARGS(&upload.p))));
-            EXPECT(submit([&] {
+            copy_target.store(again.p);
+            const bool copied = submit([&] {
                 D3D12_TEXTURE_COPY_LOCATION to{}, from{};
                 to.pResource = again.p;
                 to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -320,9 +372,19 @@ int main() {
                 from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
                 from.PlacedFootprint.Footprint = {DXGI_FORMAT_BC1_UNORM, again_width, height, 1, pitch};
                 list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
-            }));
-            std::printf("after the copy: %s\n", shared(again.p) ? "shared" : "with memory of its own");
+            });
+            copy_target.store(nullptr);
+            const bool other_ran = other_replay.joinable();
+            if (other_ran) other_replay.join();
+            EXPECT(copied);
+            std::printf("after the copy: %s; the compute queue's replay begun during it %s the shared image\n",
+                        shared(again.p) ? "shared" : "with memory of its own",
+                        !other_ran ? "did not start, nor release" : released_during_copy ? "released" : "kept");
             EXPECT(!shared(again.p));
+            EXPECT(other_ran);  // the copy's replay gave it memory of its own before it ended its command buffer
+            EXPECT(!released_during_copy);
+            // The compute queue's replay has ended; the image is released by the direct queue's next one.
+            EXPECT(rt::d3d12::shared_zero_images(device.p).images == 1);
             EXPECT(submit(empty));
             const auto filled = rt::d3d12::shared_zero_images(device.p);
             std::printf("the texture with memory of its own, alive: %llu shared images, %llu bytes\n",

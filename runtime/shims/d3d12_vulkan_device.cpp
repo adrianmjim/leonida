@@ -7738,13 +7738,25 @@ struct DeviceState {
     void release_zero_image(const D3D12_RESOURCE_DESC&, VkImage);
     // A texture that got memory of its own gives its claim back here instead: it gets it inside command prepare, with
     // the context's resource lock held (VulkanContext::resolve), where releasing the image would take that lock again
-    // and the user and image locks would be taken after it. Given back before the next submission (before_execute).
-    std::mutex zero_return_mutex;  // taken last
-    std::vector<std::pair<D3D12_RESOURCE_DESC, VkImage>> zero_returns;  // under zero_return_mutex
+    // and the user and image locks would be taken after it. Given back before a later submission (before_execute),
+    // once every ExecuteCommandLists replay in progress at the return has recorded its submissions: the replay that
+    // made it may already have commands that sample the image, and so may another queue's, whose views of it were
+    // resolved before they were forgotten. A replay of another queue starting meanwhile drains the returns before
+    // those submissions have their tickets; the image's deferred deletion (submitted ticket + 1 then) would be due
+    // when that queue's own submission completes, with theirs still pending. A return waits as a retired geometry
+    // view does (GeometryViews::kAfterExecutes): `epoch` is the last replay begun when it was made.
+    struct ZeroReturn {
+        D3D12_RESOURCE_DESC desc;
+        VkImage image;
+        std::uint64_t epoch;
+    };
+    std::mutex zero_return_mutex;  // taken last but for GeometryViews' execute_mutex_ (a leaf)
+    std::vector<ZeroReturn> zero_returns;  // under zero_return_mutex
     std::atomic<bool> zero_returns_pending{false};
     void return_zero_image(const D3D12_RESOURCE_DESC& d, VkImage image) {
         std::lock_guard lock(zero_return_mutex);
-        zero_returns.emplace_back(d, image);
+        // The texture's views of the image are forgotten already: a replay begun after this read cannot name them.
+        zero_returns.push_back({d, image, geometry.execute_epoch()});
         zero_returns_pending.store(true, std::memory_order_release);
     }
     void drain_zero_returns();
@@ -10842,17 +10854,24 @@ void DeviceState::release_zero_image(const D3D12_RESOURCE_DESC& d, VkImage image
     gone->Release();  // outside the locks: its destructor takes the descriptor and context locks
 }
 
-// The claims textures gave back on getting memory of their own (return_zero_image). Called before each submission,
-// outside the context's resource lock; the images released here are deleted after the submissions made so far.
+// The claims textures gave back on getting memory of their own (return_zero_image) once no replay in progress at the
+// return is left. Called before each submission, outside the context's resource lock; the images released here are
+// deleted after the submissions made so far, which include every submission of those replays.
 void DeviceState::drain_zero_returns() {
     if (!zero_returns_pending.load(std::memory_order_acquire)) return;
-    std::vector<std::pair<D3D12_RESOURCE_DESC, VkImage>> returns;
+    std::vector<ZeroReturn> due;
     {
         std::lock_guard lock(zero_return_mutex);
-        returns.swap(zero_returns);
-        zero_returns_pending.store(false, std::memory_order_relaxed);
+        // Read under the lock: every return looked at was made before it. kAfterExecutes with no replay in progress.
+        const std::uint64_t oldest = geometry.oldest_execute();
+        std::erase_if(zero_returns, [&](const ZeroReturn& r) {
+            if (r.epoch >= oldest) return false;
+            due.push_back(r);
+            return true;
+        });
+        zero_returns_pending.store(!zero_returns.empty(), std::memory_order_relaxed);
     }
-    for (const auto& [desc, image] : returns) release_zero_image(desc, image);
+    for (const ZeroReturn& r : due) release_zero_image(r.desc, r.image);
 }
 
 
