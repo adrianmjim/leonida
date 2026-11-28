@@ -32,7 +32,8 @@
 using namespace dsx;
 namespace fs = std::filesystem;
 
-// Counts the blocks of at least g_large_from bytes allocated while g_count_large is set, for test_reused_buffers.
+// Counts the blocks of at least g_large_from bytes allocated while g_count_large is set, for test_reused_buffers and
+// test_kept_buffers_cap.
 std::atomic<bool> g_count_large{false};
 std::atomic<size_t> g_large_from{SIZE_MAX};
 std::atomic<int> g_large_blocks{0};
@@ -1378,13 +1379,14 @@ void test_zlib(Env& env) {
     f->Release();
 }
 
-// A zlib stream of one final fixed-Huffman block (RFC 1951 3.2.6) for test_reused_buffers: each 4 KiB page of its
-// output is 1,024 bytes of pattern() given as literals, then three more copies of them as matches 1,024 bytes back.
-// Every page differs, so a swizzle that moves pages shows, and the stream is a little over a quarter of its output.
+// A zlib stream of one final fixed-Huffman block (RFC 1951 3.2.6) for test_reused_buffers: each 4 KiB page p of its
+// output is 1,024 bytes of pattern(seed + p) given as literals, then three more copies of them as matches 1,024
+// bytes back. Every page differs, so a swizzle that moves pages shows, and the stream is a little over a quarter of
+// its output.
 struct ReusedBuffersStream {
     std::vector<uint8_t> zlib, plain;
 };
-ReusedBuffersStream paged_zlib_stream(size_t pages) {
+ReusedBuffersStream paged_zlib_stream(size_t pages, uint32_t seed = 100) {
     struct Bits {
         std::vector<uint8_t> out;
         uint32_t acc = 0;
@@ -1420,7 +1422,7 @@ ReusedBuffersStream paged_zlib_stream(size_t pages) {
     w.put(1, 1);  // BFINAL
     w.put(1, 2);  // BTYPE 01: fixed Huffman codes
     for (size_t p = 0; p < pages; ++p) {
-        const auto literals = pattern(1024, static_cast<uint32_t>(100 + p));
+        const auto literals = pattern(1024, static_cast<uint32_t>(seed + p));
         for (const uint8_t x : literals) w.symbol(x);
         for (int copy = 0; copy < 4; ++copy) s.plain.insert(s.plain.end(), literals.begin(), literals.end());
         for (unsigned left = 3072; left;) {
@@ -1445,29 +1447,40 @@ ReusedBuffersStream paged_zlib_stream(size_t pages) {
     return s;
 }
 
-// A queue's worker keeps its staging buffers from one request to the next. 100 identical zlib + swizzle requests of
-// 512 KiB from a file each need three buffers of 128 KiB or more (the compressed source, the inflated bytes and the
+// A queue's worker keeps its staging buffers from one request to the next. 100 zlib + swizzle requests of 512 KiB
+// from a file each need three buffers of 128 KiB or more (the compressed source, the inflated bytes and the
 // unshuffled ones): new ones for every request used to be 300 blocks, now each of the worker's two sets of buffers
-// (its own and its paired helper's) allocates them once. Every destination still gets the bytes the stages give.
+// (its own and its paired helper's) allocates them once. The requests take turns between two streams of the same
+// size, so a stage that left bytes of a reused buffer unwritten would publish the other stream's bytes there.
 void test_reused_buffers(Env& env) {
     constexpr size_t kPages = 128, kBytes = kPages * 4096;
     constexpr int kRequests = 100;
-    const auto stream = paged_zlib_stream(kPages);
-    check(stream.plain.size() == kBytes && stream.zlib.size() > 128 * 1024 && stream.zlib.size() < kBytes,
-          "the paged zlib stream has its sizes");
-    std::vector<uint8_t> expected(kBytes);
-    check(leonida::dstorage::unshuffle(DSTORAGE_SWIZZLE_MODE_4K_4K_8K, stream.plain, expected) &&
-              expected != stream.plain,
-          "the swizzle moves the stream's pages");
-    write_file(env.game / L"data" / L"paged.bin", stream.zlib);
+    const ReusedBuffersStream streams[2] = {paged_zlib_stream(kPages, 100), paged_zlib_stream(kPages, 500)};
+    std::vector<uint8_t> expected[2], file;
+    size_t offsets[2]{};
+    for (int i = 0; i < 2; ++i) {
+        const auto& stream = streams[i];
+        check(stream.plain.size() == kBytes && stream.zlib.size() > 128 * 1024 && stream.zlib.size() < kBytes,
+              "the paged zlib stream has its sizes");
+        expected[i].resize(kBytes);
+        check(leonida::dstorage::unshuffle(DSTORAGE_SWIZZLE_MODE_4K_4K_8K, stream.plain, expected[i]) &&
+                  expected[i] != stream.plain,
+              "the swizzle moves the stream's pages");
+        offsets[i] = file.size();
+        file.insert(file.end(), stream.zlib.begin(), stream.zlib.end());
+        file.resize((file.size() + 15) / 16 * 16);  // zlib file offsets are 16-byte aligned
+    }
+    check(expected[0] != expected[1], "the two paged zlib streams differ");
+    write_file(env.game / L"data" / L"paged.bin", file);
 
     IDStorageFileX* f = open(env, L"GAME:\\data\\paged.bin");
     IDStorageQueueX2* q = make_queue(env, 0x80, false);
     IDStorageStatusArrayX* s = make_status(env, 1);
     std::vector<std::vector<uint8_t>> out(kRequests, std::vector<uint8_t>(kBytes, 0xEE));
-    for (auto& o : out) {
-        DSTORAGE_REQUEST r = file_request(f, 0, o.data(), static_cast<uint32_t>(kBytes));
-        r.SourceSize = static_cast<uint32_t>(stream.zlib.size());
+    for (int i = 0; i < kRequests; ++i) {
+        const int which = i % 2;
+        DSTORAGE_REQUEST r = file_request(f, offsets[which], out[i].data(), static_cast<uint32_t>(kBytes));
+        r.SourceSize = static_cast<uint32_t>(streams[which].zlib.size());
         r.Options.AsUINT64 =
             options::kZlib | static_cast<uint64_t>(DSTORAGE_SWIZZLE_MODE_4K_4K_8K) << options::kSwizzleShift;
         q->EnqueueRequest(&r);
@@ -1481,11 +1494,63 @@ void test_reused_buffers(Env& env) {
     g_count_large = false;
     check(done, "the paged zlib requests complete");
     check_hr(s->GetHResult(0), S_OK, "the paged zlib requests succeed");
-    check(std::all_of(out.begin(), out.end(), [&](const std::vector<uint8_t>& o) { return o == expected; }),
-          "every paged zlib request writes the inflated, unshuffled bytes");
+    bool exact = true;
+    for (int i = 0; i < kRequests; ++i) exact = exact && out[i] == expected[i % 2];
+    check(exact, "every paged zlib request writes its own stream's bytes, inflated and unshuffled");
     const int blocks = g_large_blocks.load();
     std::printf("dstorage: %d paged zlib requests allocated %d blocks of 128 KiB or more\n", kRequests, blocks);
     check(blocks <= 2 * 3, "a queue's worker reuses its staging buffers across requests");
+    s->Release();
+    q->Release();
+    f->Release();
+}
+
+// A queue's worker keeps at most 16 MiB of its buffers between requests. A zlib request inflating 20 MiB from a
+// 5.6 MiB source leaves 25.6 MiB in them: the 20 MiB output goes, the source buffer stays. The same request again
+// allocates both blocks of 2 MiB or more again (no worker held on to its 20 MiB), and then a request inflating
+// 4 MiB from 1.1 MiB allocates none: its output fits in the kept buffer.
+void test_kept_buffers_cap(Env& env) {
+    constexpr size_t kBigPages = 5120, kSmallPages = 1024, kLarge = 2u << 20;
+    const auto big = paged_zlib_stream(kBigPages, 700), little = paged_zlib_stream(kSmallPages, 900);
+    check(big.zlib.size() >= little.plain.size() && big.zlib.size() <= (16u << 20) && little.zlib.size() < kLarge &&
+              big.plain.size() > (16u << 20),
+          "the capped zlib streams have their sizes");
+    std::vector<uint8_t> file = big.zlib;
+    file.resize((file.size() + 15) / 16 * 16);  // zlib file offsets are 16-byte aligned
+    const size_t little_offset = file.size();
+    file.insert(file.end(), little.zlib.begin(), little.zlib.end());
+    write_file(env.game / L"data" / L"capped.bin", file);
+
+    IDStorageFileX* f = open(env, L"GAME:\\data\\capped.bin");
+    IDStorageQueueX2* q = make_queue(env, 0x80, false);
+    IDStorageStatusArrayX* s = make_status(env, 3);
+    std::vector<uint8_t> out[3] = {std::vector<uint8_t>(big.plain.size(), 0xEE),
+                                   std::vector<uint8_t>(big.plain.size(), 0xEE),
+                                   std::vector<uint8_t>(little.plain.size(), 0xEE)};
+    int blocks[3]{};
+    g_large_from = kLarge;
+    for (UINT32 i = 0; i < 3; ++i) {
+        const auto& stream = i < 2 ? big : little;
+        DSTORAGE_REQUEST r = file_request(f, i < 2 ? 0 : little_offset, out[i].data(),
+                                          static_cast<uint32_t>(stream.plain.size()));
+        r.SourceSize = static_cast<uint32_t>(stream.zlib.size());
+        r.Options.AsUINT64 = options::kZlib;
+        q->EnqueueRequest(&r);
+        q->EnqueueStatus(s, i);
+        g_large_blocks = 0;
+        g_count_large = true;
+        q->Submit();
+        const bool done = wait_complete(s, i, 60000);
+        g_count_large = false;
+        blocks[i] = g_large_blocks.load();
+        check(done, "the capped zlib request completes");
+        check_hr(s->GetHResult(i), S_OK, "the capped zlib request succeeds");
+        check(out[i] == stream.plain, "the capped zlib request writes the inflated bytes");
+    }
+    std::printf("dstorage: capped zlib requests allocated %d, %d and %d blocks of 2 MiB or more\n", blocks[0],
+                blocks[1], blocks[2]);
+    check(blocks[0] == 2 && blocks[1] == 2, "a worker keeps no buffers over its cap between requests");
+    check(blocks[2] == 0, "a worker keeps its buffers up to its cap between requests");
     s->Release();
     q->Release();
     f->Release();
@@ -2098,6 +2163,7 @@ int main() {
     test_guarded_destinations(env);
     test_zlib(env);  // after test_stats, whose request totals it would change
     test_reused_buffers(env);
+    test_kept_buffers_cap(env);
 
     fs::remove_all(env.root, ec);
     std::printf("dstorage: %d checks, %d failures\n", g_checks, g_failures);

@@ -622,14 +622,23 @@ void room(Bytes& buffer, size_t n) {
 // staging pool, which counts the requests running.
 struct Scratch {
     Bytes data, spare;
-    // At most this is kept between requests, the budget of a request that may run beside another (can_prepare): a
-    // larger request has its buffers for its own time.
+    // What a queue's worker keeps of its two sets (its own and its helper's) between requests, the budget of a request
+    // that may run beside another (can_prepare): a larger request has its buffers for its own time. Each queue has its
+    // own worker, so idle queues hold at most this each.
     static constexpr uint64_t kKept = 16ull << 20;
-    void trim() {
-        Bytes& larger = data.capacity() >= spare.capacity() ? data : spare;
-        Bytes& smaller = &larger == &data ? spare : data;
-        if (larger.capacity() + smaller.capacity() > kKept) larger = Bytes();
-        if (smaller.capacity() > kKept) smaller = Bytes();
+    // Gives up buffers of both sets, largest first, until those kept hold at most kKept. Both sets count together:
+    // trimmed apart, a queue whose requests pair would keep twice the cap.
+    static void trim(Scratch& own, Scratch& helper) {
+        Bytes* buffers[] = {&own.data, &own.spare, &helper.data, &helper.spare};
+        std::sort(std::begin(buffers), std::end(buffers),
+                  [](const Bytes* a, const Bytes* b) { return a->capacity() > b->capacity(); });
+        uint64_t kept = 0;
+        for (const Bytes* b : buffers) kept += b->capacity();
+        for (Bytes* b : buffers) {
+            if (kept <= kKept) break;
+            kept -= b->capacity();
+            *b = Bytes();
+        }
     }
 };
 
@@ -1067,15 +1076,14 @@ private:
                 in_flight_ = paired ? 2 : 1;
             }
             process(head, nullptr, own, paired);
-            own.trim();
             release_references(head);
             if (paired) {
                 WaitForThreadpoolWorkCallbacks(preparation_work_, FALSE);
                 process(next, &prepared, helper);
-                helper.trim();
                 release_references(next);
                 helper_job_ = nullptr;
             }
+            Scratch::trim(own, helper);
             {
                 std::lock_guard lock(mutex_);
                 in_flight_ = 0;
