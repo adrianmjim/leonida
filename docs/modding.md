@@ -35,7 +35,8 @@ At start the runtime prints what it loaded, for example:
 install, list, check, enable, disable, pack and remove mods. A package is a normal ZIP file (the `.leonidamod`
 extension is only a name) with `mod.json` at its top level or inside one top-level folder. The installer refuses
 paths that climb out of the package, links and manifests the runtime would reject; it never goes online and never
-copies game data.
+copies game data. `list` and `check` read each `mod.json` by the runtime's rules, the `camera` section and a
+byte-order mark included, and show the camera a mod sets next to its swaps.
 
 On Windows, double-click **`Mods.bat`** for the Tkinter window (on Linux and macOS, run **`./Mods.sh`**; it needs
 Tkinter, `python3-tk` on Debian and Ubuntu): choose the port folder, install a ZIP or folder,
