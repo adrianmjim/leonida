@@ -120,7 +120,9 @@ int live() {
                  mp::mib(counters_after.private_working_set));
     EXPECT(after.committed[mp::b_pe_private] >= before.committed[mp::b_pe_private] + 64 * kMiB);
     EXPECT(counters_before.read && counters_after.read);
-    EXPECT(counters_after.private_commit >= counters_before.private_commit + 64 * kMiB);
+    // Wine's commit charge does not count what the process commits (MEASURED under Wine 11.0 on macOS: it stays put
+    // after the 64 MiB), so like the private working set below it is checked on Windows only.
+    if (!wine) EXPECT(counters_after.private_commit >= counters_before.private_commit + 64 * kMiB);
     EXPECT(counters_after.working_set > 0 && counters_after.peak_working_set >= counters_after.working_set);
     if (!wine && counters_after.private_working_set_reported) EXPECT(counters_after.private_working_set > 0);
     bool listed = false;
