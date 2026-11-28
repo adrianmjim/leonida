@@ -895,7 +895,19 @@ bool matches(const Callback& c, const Event& e) {
     }
 }
 
+// The token of the callback running on this thread, for kCurrentCallbackToken; 0 outside a callback.
+thread_local GameInputCallbackToken t_running_token = kInvalidCallbackToken;
+
+GameInputCallbackToken resolve_token(GameInputCallbackToken token) {
+    return token == kCurrentCallbackToken ? t_running_token : token;
+}
+
 void call(const Callback& c, const Event& e) {
+    struct Running {  // restored on return, so a callback that drives another delivery keeps its own token
+        GameInputCallbackToken saved = t_running_token;
+        explicit Running(GameInputCallbackToken t) { t_running_token = t; }
+        ~Running() { t_running_token = saved; }
+    } running(c.token);
     switch (c.type) {
         case CbType::Device:
             reinterpret_cast<GameInputDeviceCallback>(c.fn)(c.token, c.context, e.device, e.timestamp, e.current, e.previous);
@@ -1698,10 +1710,10 @@ bool async_key_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 //
 // The cursor stops at the edge of the screen, so cursor deltas stop too. Raw input reports what the mouse itself
 // moved, with no edge and no pointer acceleration. A message-only window (never shown) on its own thread receives
-// WM_INPUT and adds each movement to a running total; system_cursor_pos then returns that total as an edgeless
+// WM_INPUT and adds each movement to a running total; raw_cursor_pos then returns that total as an edgeless
 // "cursor", and update_keyboard_pad takes the difference between polls exactly as it did with the real cursor.
 std::atomic<long long> g_raw_x{0}, g_raw_y{0};  // total raw movement since the thread started, mouse counts
-std::atomic<bool> g_raw_ready{false};           // registration worked; system_cursor_pos uses the totals
+std::atomic<bool> g_raw_ready{false};           // registration worked; the pad can use the totals
 std::atomic<bool> g_raw_started{false};         // the thread is started once per process
 
 LRESULT CALLBACK raw_mouse_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1758,12 +1770,13 @@ void start_raw_mouse() {
     if (!g_raw_started.exchange(true)) std::thread(raw_mouse_thread).detach();
 }
 
+bool raw_cursor_pos(int* x, int* y) {
+    *x = static_cast<int>(g_raw_x.load());
+    *y = static_cast<int>(g_raw_y.load());
+    return true;
+}
+
 bool system_cursor_pos(int* x, int* y) {
-    if (g_raw_ready) {  // the edgeless total; it wraps only after ±2^31 counts, and the poll uses differences
-        *x = static_cast<int>(g_raw_x.load());
-        *y = static_cast<int>(g_raw_y.load());
-        return true;
-    }
     POINT p;
     if (!GetCursorPos(&p)) return false;
     *x = p.x;
@@ -1784,6 +1797,7 @@ std::atomic<rt::gameinput::CursorPosFn> g_cursor_pos{system_cursor_pos};
 struct KeyboardPad : rt::gameinput::detail::KeyboardPadConnection<SDL_JoystickID, SDL_Joystick*> {
     int right_x = 0, right_y = 0;    // the mouse's right stick, SDL axis units (+Y down)
     int cursor_x = 0, cursor_y = 0;  // the cursor at the last poll
+    rt::gameinput::CursorPosFn cursor_source = nullptr;
     bool have_cursor = false;        // cursor_x/y are valid; false after focus loss, so the first poll moves nothing
 };
 KeyboardPad g_keyboard;
@@ -1884,6 +1898,7 @@ void update_keyboard_pad() {
     bool down[SDL_GAMEPAD_BUTTON_COUNT] = {};
     int lx = 0, ly = 0;
     bool aim = false, fire = false;
+    bool raw_mouse = false;
     // Focus gates physical keyboard and mouse input. Read the cursor afresh on return to avoid a jump.
     // Scripted presses still run while the window is unfocused.
     const bool active = mode == rt::gameinput::KeyboardPadMode::Always || g_has_focus.load()();
@@ -1896,7 +1911,15 @@ void update_keyboard_pad() {
         fire = key_down(VK_LBUTTON);
 
         int x = 0, y = 0;
-        const bool have = g_cursor_pos.load()(&x, &y);
+        auto cursor_source = g_cursor_pos.load();
+        raw_mouse = cursor_source == system_cursor_pos && g_raw_ready;
+        if (raw_mouse) cursor_source = raw_cursor_pos;
+        // The first sample from a new coordinate source establishes its baseline.
+        if (cursor_source != g_keyboard.cursor_source) {
+            g_keyboard.cursor_source = cursor_source;
+            g_keyboard.have_cursor = false;
+        }
+        const bool have = cursor_source(&x, &y);
         const bool moved = have && g_keyboard.have_cursor;
         // Raw input exposes the low bits of a running total. Keep subtraction modular across a wrap.
         auto delta = [](int current, int previous) {
@@ -1915,7 +1938,7 @@ void update_keyboard_pad() {
         g_keyboard.right_x = g_keyboard.right_y = 0;
         g_keyboard.have_cursor = false;
     }
-    clip_cursor(active && g_raw_ready && g_cursor_pos.load() == system_cursor_pos && foreground_is_ours());
+    clip_cursor(raw_mouse && foreground_is_ours());
     for (const auto& b : kKeyBindings) SDL_SetJoystickVirtualButton(g_keyboard.js, b.sdl_button, down[b.sdl_button]);
     // LEONIDA_INPUT_SCRIPT="a@70,a@85,start@120" (with LEONIDA_KEYBOARD_PAD=always): timed presses on the keyboard
     // pad, in seconds since the pad's first update, each held 300 ms or its own button@seconds:hold, and then until the
@@ -2717,6 +2740,8 @@ public:
     }
 
     void STDMETHODCALLTYPE StopCallback(GameInputCallbackToken token) override {
+        token = resolve_token(token);
+        if (token == kInvalidCallbackToken) return;
         std::lock_guard lock(g().mu);
         for (Callback& c : g().callbacks)
             if (c.token == token) c.active = false;
@@ -2725,6 +2750,8 @@ public:
     // Removes the callback and, unless called from inside a callback, waits for one that is running to return.
     // VERIFY: the timeout is not honoured; the wait is for at most one callback.
     bool STDMETHODCALLTYPE UnregisterCallback(GameInputCallbackToken token, uint64_t) override {
+        token = resolve_token(token);
+        if (token == kInvalidCallbackToken) return false;
         State& s = g();
         bool found = false;
         {

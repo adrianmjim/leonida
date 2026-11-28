@@ -114,7 +114,7 @@ Vulkan layer is not playable on any platform yet. What runs where today, for the
 | macOS (Apple Silicon) | The Python tools and the Vulkan test tools run natively, on MoltenVK (Homebrew) or KosmicKrisp. The runtime is Windows code and runs as on Linux, under Wine: CrossOver, arm64 with FEX or x86-64 under Rosetta (#1706, #1707, #1924; #3119 fixes the last loader tests there). Known gaps: no geometry stage and no `VK_EXT_mesh_shader` (those tests are skipped), 32-wide subgroups (wave64 shaders run emulated), and MoltenVK's float handling (`PerVertexKHR`, NaN compares, -0, the cost of `NoContraction`); [docs/testing.md](docs/testing.md) lists each (#2947). |
 | AMD RDNA1 (RX 5000) | A supported target: close to the console's RDNA2, and its 64-wide subgroups run the wave64 shaders natively. RX 5700 XT results pass the GPU test suite (#146); on RADV, pixel shaders without fragment barycentrics have a known difference (*Known problems* in [docs/testing.md](docs/testing.md)) (#330). |
 
-GPU results from every platform are collected in #166; how to run the tests is in [docs/testing.md](docs/testing.md).
+GPU results from every platform are submitted as pull requests adding a file to [gpu-test-results/](gpu-test-results); how to run the tests is in [docs/testing.md](docs/testing.md).
 
 ## How to build
 

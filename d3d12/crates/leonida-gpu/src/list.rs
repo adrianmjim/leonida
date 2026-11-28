@@ -218,9 +218,11 @@ impl Detached {
     }
 }
 
-/// A host list that has run and waits to be used again.
+/// A host list that has run and waits to be used again, and when it was put
+/// by (`crate::host::now_ms`). The bytes of upload memory it keeps are the
+/// pool's ([`Pool`]).
 #[cfg(windows)]
-struct Idle(crate::host::HostList);
+struct Idle(crate::host::HostList, u64);
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -263,6 +265,15 @@ impl<T> Pool<T> {
         None
     }
 
+    /// Takes out the oldest `n` things.
+    fn take_oldest(&mut self, n: usize) -> Vec<(T, u64)> {
+        let gone: Vec<(T, u64)> = self.kept.drain(..n.min(self.kept.len())).collect();
+        self.bytes -= gone.iter().map(|(_, bytes)| bytes).sum::<u64>();
+        // The ones taken out were the oldest of those nobody took.
+        self.low = self.low.saturating_sub(gone.len());
+        gone
+    }
+
     /// Takes out the oldest half (rounded up) of the things nobody took
     /// since the last trim, so that what is kept follows what was needed
     /// lately. Halving rather than taking out all of them keeps a need that
@@ -295,6 +306,13 @@ static IDLE: std::sync::Mutex<Pool<Idle>> = std::sync::Mutex::new(Pool::new());
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
+/// How many of the first of `put_by` (when each idle list was put by, the
+/// oldest first) are more than `max_age` old at `now`.
+#[cfg(any(windows, test))]
+fn stale(put_by: impl Iterator<Item = u64>, now: u64, max_age: u64) -> usize {
+    put_by.take_while(|&t| now.saturating_sub(t) > max_age).count()
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `LEONIDA_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
@@ -309,7 +327,7 @@ fn pools() -> bool {
 fn fresh_list() -> Option<crate::host::HostList> {
     let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner()).take();
     match idle {
-        Some(Idle(list)) => Some(list),
+        Some(Idle(list, _)) => Some(list),
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
 }
@@ -351,9 +369,26 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // goes, its allocators stay.
         host.reset();
         let bytes = host.scratch_kept();
-        let refused = IDLE.lock().unwrap_or_else(|e| e.into_inner()).give(Idle(host), bytes, IDLE_MOST);
+        let now = crate::host::now_ms();
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let refused = idle.give(Idle(host, now), bytes, IDLE_MOST);
+        // (`LEONIDA_ALLOCATOR_TRIM=1`) Lists the frames did not need for
+        // that long are let go, with their allocators: the pool is last in,
+        // first out, so its oldest are the surplus of a spike, and nothing
+        // resets them again. Their submissions have run, as every idle
+        // list's (one the full pool turns away goes the same way).
+        let gone = match crate::host::allocator_trim() {
+            Some(secs) if refused.is_none() => {
+                let n = stale(idle.kept.iter().map(|(i, _)| i.1), now, secs * 1000);
+                crate::host::ALLOCATOR_TRIMS[2].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                idle.take_oldest(n)
+            }
+            _ => Vec::new(),
+        };
         // (Dropped outside the lock.)
+        drop(idle);
         drop(refused);
+        drop(gone);
     }
 }
 
@@ -1173,6 +1208,107 @@ fn unlike(dst: This, src: This) -> bool {
     unlike
 }
 
+/// A texture's shape for [`clip_to_destination`]: its DXGI format, width,
+/// height, depth or array size, levels and whether it is 3D.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug)]
+struct Shape {
+    format: u32,
+    width: u64,
+    height: u32,
+    depth_or_array: u32,
+    levels: u32,
+    volume: bool,
+}
+
+#[cfg(any(windows, test))]
+impl Shape {
+    /// The width, height and depth of subresource `sub`, in texels.
+    fn level(&self, sub: u32) -> [u64; 3] {
+        let level = sub % self.levels.max(1);
+        let depth = if self.volume { (u64::from(self.depth_or_array) >> level).max(1) } else { 1 };
+        [(self.width >> level).max(1), (u64::from(self.height) >> level).max(1), depth]
+    }
+}
+
+/// Whether a texture to texture copy whose region does not fit its
+/// destination level is cut to what fits (on; `LEONIDA_COPY_CLIP=0`: passed
+/// on whole, as before).
+///
+/// The title compresses its baked decorations block by block into a 32x32
+/// R32G32_UINT (BC1) or R32G32B32A32_UINT (BC3, BC7) scratch texture for
+/// every level of the result and copies the whole scratch, with no box, into
+/// each level of the block-compressed texture, the 16x16 to 2x2 block levels
+/// too. Such a copy is not one the host allows (the source region must fit
+/// the destination subresource), and those levels kept what title memory
+/// held when the texture was first uploaded: other textures' bytes, a colour
+/// that differs from run to run where a character's skin is seen from a few
+/// metres (the fork's prison guard's tattooed arm). That the console cuts
+/// such a copy to the destination is the fork's reading of what the title
+/// does, not something measured on a console.
+///
+/// From edsuuu/VI-BR-PORT 7377418 (edsuuu), GPL-3.0.
+#[cfg(windows)]
+fn copy_clip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_COPY_CLIP").is_none_or(|v| v != "0"))
+}
+
+/// The source box of a texture to texture copy of `source`'s subresource
+/// `src_sub` (`source_box`, `None` for all of it) into `destination`'s
+/// `dst_sub` at `at`, cut to what fits that level: `Some(None)` or the box
+/// given when it fits as it is, `Some(Some(box))` cut, `None` when nothing
+/// fits. Sizes are compared in elements (blocks of a block-compressed
+/// format, texels of another), as the host copies between a compressed
+/// format and an uncompressed one of the block's size: one texel to one
+/// block. Formats [`crate::resource::element`] does not know are left as
+/// they are.
+#[cfg(any(windows, test))]
+fn clip_to_destination(
+    destination: Shape,
+    dst_sub: u32,
+    at: [u32; 3],
+    source: Shape,
+    src_sub: u32,
+    source_box: Option<[u32; 6]>,
+) -> Option<Option<[u32; 6]>> {
+    let (Some((_, to_block)), Some((_, from_block))) =
+        (crate::resource::element(destination.format), crate::resource::element(source.format))
+    else {
+        return Some(source_box);
+    };
+    let to_level = destination.level(dst_sub);
+    let from_level = source.level(src_sub);
+    // (Depth is never in blocks.)
+    let to_blocks = [to_block, to_block, 1];
+    let from_blocks = [from_block, from_block, 1];
+    let whole = [0, 0, 0, from_level[0] as u32, from_level[1] as u32, from_level[2] as u32];
+    let given = source_box.unwrap_or(whole);
+    let mut cut = given;
+    for axis in 0..3 {
+        // Elements of the destination level from the corner on.
+        let room = to_level[axis].div_ceil(to_blocks[axis]).saturating_sub(u64::from(at[axis]) / to_blocks[axis]);
+        if room == 0 {
+            return None;
+        }
+        let (start, end) = (u64::from(given[axis]), u64::from(given[axis + 3]));
+        let elements = end.saturating_sub(start).div_ceil(from_blocks[axis]);
+        if elements > room {
+            // The source's own level edge stays the end where it comes first
+            // (a block-compressed level smaller than a block).
+            cut[axis + 3] = (start + room * from_blocks[axis]).min(from_level[axis]) as u32;
+        }
+    }
+    Some((cut != given).then_some(cut).or(source_box))
+}
+
+/// Texture to texture copies cut to their destination level
+/// ([`clip_to_destination`]) and those left out because nothing of them
+/// fit, since the start.
+#[cfg(windows)]
+pub(crate) static CLIPPED_COPIES: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
 /// Copies left out because both sides were one host texture
 /// ([`copy_resource`], [`copy_texture_region`]), since the start.
 #[cfg(windows)]
@@ -1322,6 +1458,8 @@ extern "system" fn copy_texture_region(
         let mut from = src;
         // Both sides are the same subresource of one host texture (set below).
         let mut same = false;
+        // The source texture's host description, for `clip_to_destination`.
+        let mut source_desc = None;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
@@ -1372,6 +1510,10 @@ extern "system" fn copy_texture_region(
             }
             if !same {
                 ensure_state(list, src.resource, COPY_SOURCE);
+            }
+            if copy_clip() && dst.kind != FOOTPRINT {
+                // SAFETY: a live resource.
+                source_desc = Some(unsafe { texture.GetDesc() });
             }
             from.resource = texture.as_raw().cast_const().cast();
         }
@@ -1424,14 +1566,79 @@ extern "system" fn copy_texture_region(
         ensure_state(list, dst.resource, COPY_DEST);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
-        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+        let mut host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+        // A region larger than the destination level, cut to it
+        // (`copy_clip`); the cut box lives until the copy is recorded.
+        let mut cut_box = None;
+        if let Some(from_desc) = source_desc {
+            use windows::Win32::Graphics::Direct3D12::{D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_TEXTURE3D};
+            let shape = |d: &D3D12_RESOURCE_DESC| Shape {
+                format: d.Format.0 as u32,
+                width: d.Width,
+                height: d.Height,
+                depth_or_array: u32::from(d.DepthOrArraySize),
+                levels: u32::from(d.MipLevels),
+                volume: d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+            };
+            // SAFETY: a live texture; the box is the title's or null.
+            let (to_desc, given) = unsafe { (to.GetDesc(), host_box.map(|b| b.cast::<[u32; 6]>().read_unaligned())) };
+            let clipped = clip_to_destination(
+                shape(&to_desc),
+                dst.footprint.offset as u32,
+                [x, y, z],
+                shape(&from_desc),
+                src.footprint.offset as u32,
+                given,
+            );
+            let counted = |i: usize| {
+                let n = CLIPPED_COPIES[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    tracing::info!(
+                        copies = n,
+                        destination = format_args!(
+                            "{}x{} f{} sub {}",
+                            to_desc.Width,
+                            to_desc.Height,
+                            to_desc.Format.0,
+                            dst.footprint.offset as u32
+                        ),
+                        at = ?[x, y, z],
+                        source = format_args!(
+                            "{}x{} f{} sub {}",
+                            from_desc.Width,
+                            from_desc.Height,
+                            from_desc.Format.0,
+                            src.footprint.offset as u32
+                        ),
+                        given = ?given,
+                        cut = ?clipped,
+                        "a texture copy larger than its destination level was {} (LEONIDA_COPY_CLIP)",
+                        if i == 0 { "cut to it" } else { "left out: nothing of it fits" }
+                    );
+                }
+            };
+            match clipped {
+                None => {
+                    counted(1);
+                    return;
+                }
+                Some(Some(b)) if Some(b) != given => {
+                    counted(0);
+                    cut_box = Some(b);
+                }
+                _ => {}
+            }
+        }
+        if let Some(b) = &cut_box {
+            host_box = Some(std::ptr::from_ref(b).cast::<D3D12_BOX>());
+        }
         #[cfg(feature = "diagnostics")]
         {
             let text = || {
-                // SAFETY: a live texture; the box is the title's or null.
+                // SAFETY: a live texture; the box is the title's, ours or null.
                 let (d, b) = unsafe { (to.GetDesc(), host_box.map(|b| *b)) };
                 format!(
-                    "copy to {:?} {}x{} f{} sub/kind {} at {x},{y},{z} from {:?} kind {} footprint {:?} box {b:?}",
+                    "copy to {:?} {}x{} f{} sub/kind {} at {x},{y},{z} from {:?} kind {} footprint {:?} box {b:?} subresources {} from {}",
                     dst.resource,
                     d.Width,
                     d.Height,
@@ -1439,7 +1646,11 @@ extern "system" fn copy_texture_region(
                     dst.kind,
                     src.resource,
                     src.kind,
-                    (src.kind == FOOTPRINT).then_some(src.footprint)
+                    (src.kind == FOOTPRINT).then_some(src.footprint),
+                    // (Last, for readers of the older lines: the levels the
+                    // "sub/kind" above never showed.)
+                    dst.footprint.offset as u32,
+                    src.footprint.offset as u32
                 )
             };
             match read {
@@ -1450,7 +1661,7 @@ extern "system" fn copy_texture_region(
         const _: () =
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
         // SAFETY: an open list; both locations in the host's layout, naming
-        // live resources; the box is the title's (same layout).
+        // live resources; the box is the title's or `cut_box` (same layout).
         unsafe {
             list.list.CopyTextureRegion(
                 (&raw const to_location).cast(),
@@ -2672,6 +2883,53 @@ mod tests {
     use super::*;
     use crate::object::slot;
 
+    /// A 2D texture's [`Shape`].
+    fn flat(format: u32, side: u32, levels: u32) -> Shape {
+        Shape { format, width: u64::from(side), height: side, depth_or_array: 1, levels, volume: false }
+    }
+
+    /// (`LEONIDA_ALLOCATOR_TRIM`) The idle lists let go are the oldest put
+    /// by, those older than the trim's time; the pool is in that order.
+    #[test]
+    fn the_oldest_idle_lists_are_the_stale_ones() {
+        assert_eq!(stale([0, 10_000, 29_000, 40_000].into_iter(), 40_000, 30_000), 1);
+        assert_eq!(stale([0, 5_000, 9_000, 40_000].into_iter(), 40_000, 30_000), 3);
+        assert_eq!(stale([20_000, 40_000].into_iter(), 40_000, 30_000), 0);
+        // (Exactly that old is not yet stale; the one just put by never is.)
+        assert_eq!(stale([10_000, 40_000].into_iter(), 40_000, 30_000), 0);
+        assert_eq!(stale(std::iter::empty(), 40_000, 30_000), 0);
+    }
+
+    /// After edsuuu/VI-BR-PORT 7377418.
+    #[test]
+    fn a_compression_scratch_is_cut_to_the_level_it_is_copied_into() {
+        // The decoration bake's BC1 result (128x128, 8 levels) and its
+        // 32x32 R32G32_UINT scratch, copied whole into every level.
+        let bc1 = flat(71, 128, 8);
+        let scratch = flat(17, 32, 1);
+        // Level 0: 32x32 blocks, it fits.
+        assert_eq!(clip_to_destination(bc1, 0, [0; 3], scratch, 0, None), Some(None));
+        // Level 1 (64x64 texels, 16x16 blocks) and level 5 (4x4 texels, a
+        // block): only that many scratch texels.
+        assert_eq!(clip_to_destination(bc1, 1, [0; 3], scratch, 0, None), Some(Some([0, 0, 0, 16, 16, 1])));
+        assert_eq!(clip_to_destination(bc1, 5, [0; 3], scratch, 0, None), Some(Some([0, 0, 0, 1, 1, 1])));
+        // Levels smaller than a block take one: a 1x1 scratch fits as it is.
+        let one = flat(17, 1, 1);
+        assert_eq!(clip_to_destination(bc1, 7, [0; 3], one, 0, None), Some(None));
+        // A box of its own is cut the same way; one that fits is kept.
+        let given = Some([0, 0, 0, 66, 66, 1]);
+        assert_eq!(clip_to_destination(flat(71, 4224, 1), 0, [0, 528, 0], flat(17, 66, 1), 0, given), Some(given));
+        assert_eq!(clip_to_destination(bc1, 2, [16, 0, 0], scratch, 0, given), Some(Some([0, 0, 0, 4, 8, 1])));
+        // Nothing fits past the level's edge.
+        assert_eq!(clip_to_destination(bc1, 2, [32, 0, 0], scratch, 0, None), None);
+        // Block-compressed to block-compressed: the source's own edge.
+        let small = flat(71, 8, 2);
+        assert_eq!(clip_to_destination(flat(71, 4, 1), 0, [0; 3], small, 1, None), Some(None));
+        assert_eq!(clip_to_destination(flat(71, 4, 1), 0, [0; 3], small, 0, None), Some(Some([0, 0, 0, 4, 4, 1])));
+        // A format the element table does not know is left as given.
+        assert_eq!(clip_to_destination(flat(0, 4, 1), 0, [0; 3], flat(17, 32, 1), 0, None), Some(None));
+    }
+
     #[test]
     fn the_dlss_mode_follows_the_sizes() {
         // Series X, 2160 lines out: 1440 quality, 1296 and 1253 balanced, 1080 performance, 720 ultra performance.
@@ -2833,6 +3091,24 @@ mod tests {
             pool.trim();
         }
         assert!(pool.kept.is_empty() && pool.bytes == 0);
+    }
+
+    /// `LEONIDA_ALLOCATOR_TRIM`'s cut of the oldest idle lists keeps the
+    /// pool's bytes, and its count of those nobody took, true.
+    #[cfg(windows)]
+    #[test]
+    fn taking_out_the_oldest_keeps_the_pools_counts() {
+        let mut pool: Pool<u32> = Pool::new();
+        for i in 0..6 {
+            assert_eq!(pool.give(i, 10 + u64::from(i), IDLE_MOST), None);
+        }
+        assert!(pool.trim().is_empty());
+        // Nobody takes any for a while: the six are all untouched.
+        let gone = pool.take_oldest(2);
+        assert_eq!(gone.iter().map(|(t, _)| *t).collect::<Vec<_>>(), [0, 1], "the oldest go first");
+        assert_eq!(pool.bytes, 12 + 13 + 14 + 15);
+        assert_eq!(pool.low, 4, "four untouched ones are left");
+        assert!(pool.take_oldest(99).len() == 4 && pool.kept.is_empty() && pool.bytes == 0 && pool.low == 0);
     }
 
     /// An offset near `u64::MAX` must not overflow and write outside the
