@@ -3,11 +3,13 @@ import contextlib
 import io
 import json
 import os
+import stat
 import struct
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -454,6 +456,74 @@ class AuditShader4RegsTests(unittest.TestCase):
         )]
         _s_rbw, v_rbw, _patterns = audit_mod.rbw_registers(insns)
         self.assertEqual(v_rbw, [2, 3, 4, 5])
+
+
+    def test_load_stage_map_bom_malformed_entries_and_deep_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            os.mkdir(disasm)
+            with open(os.path.join(disasm, "sample.s"), "w", encoding="utf-8") as f:
+                f.write("\ts_endpgm\n")
+            idx = os.path.join(tmp, "index.json")
+
+            # UTF-8 BOM + mixed malformed list rows + unhashable stage values must not crash or drop valid entries.
+            raw_list = [
+                "not-a-dict",
+                {"file": 123, "stage": "cs"},
+                {"file": "bad_stage.dxbc", "stage": ["unhashable"]},
+                {"file": "sample.dxbc", "stage": "cs"},
+            ]
+            with open(idx, "wb") as f:
+                f.write(b"\xef\xbb\xbf" + json.dumps(raw_list).encode("utf-8"))
+            smap = audit_mod.load_stage_map(disasm)
+            self.assertEqual(smap["sample"], "cs")
+            self.assertEqual(smap["bad_stage"], "?")
+            self.assertEqual(audit_mod.audit(disasm)["cs"]["count"], 1)
+
+            # Dict form with unhashable stage must not raise TypeError during audit().
+            with open(idx, "wb") as f:
+                f.write(b"\xef\xbb\xbf" + json.dumps({"sample": {"stage": ["list"]}}).encode("utf-8"))
+            self.assertEqual(audit_mod.audit(disasm)["cs"]["count"], 0)
+
+            # Deeply nested JSON (RecursionError) is caught like other invalid JSON.
+            with mock.patch.object(audit_mod.json, "load", side_effect=RecursionError):
+                self.assertEqual(audit_mod.load_stage_map(disasm), {})
+
+    def test_read_psv0_rejects_truncated_chunk_or_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # Truncated PSV0 chunk payload (plen extends past EOF).
+            full = make_dxbc([make_ms_psv0()])
+            trunc_chunk = os.path.join(tmp, "trunc_chunk.dxbc")
+            with open(trunc_chunk, "wb") as f:
+                f.write(full[:-12])
+            self.assertIsNone(audit_mod.read_psv0(trunc_chunk))
+
+            # PSV0 chunk whose inner rsize exceeds chunk payload bytes.
+            bad_rec_dxbc = make_dxbc([(b"PSV0", struct.pack("<I", 56) + bytes(16))])
+            trunc_rec = os.path.join(tmp, "trunc_rec.dxbc")
+            with open(trunc_rec, "wb") as f:
+                f.write(bad_rec_dxbc)
+            self.assertIsNone(audit_mod.read_psv0(trunc_rec))
+
+    def test_write_json_is_atomic_and_preserves_permissions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "report.json")
+            with open(out, "w", encoding="utf-8") as f:
+                f.write("previous\n")
+            if os.name != "nt":
+                os.chmod(out, 0o640)
+            with mock.patch.object(audit_mod, "replace_retry", side_effect=OSError("busy")):
+                with self.assertRaises(OSError):
+                    audit_mod.write_json(out, {"cs": {"count": 1}})
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "previous\n")
+            self.assertEqual(os.listdir(tmp), ["report.json"])
+
+            audit_mod.write_json(out, {"cs": {"count": 1}})
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), {"cs": {"count": 1}})
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(os.stat(out).st_mode), 0o640)
 
 
 def setUpModule():

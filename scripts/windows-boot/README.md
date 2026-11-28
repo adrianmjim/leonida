@@ -99,3 +99,33 @@ game processes on one GPU make both runs meaningless and can take the driver dow
 | `minidump.py PID OUT.dmp` | a minidump through dbghelp's `MiniDumpWriteDump`. Do not use `rundll32 comsvcs.dll MiniDump`: Defender flags it. A dump holds game memory: local only |
 
 Each prints its usage with `-h` (Python) or `Get-Help` (PowerShell).
+
+## Recover a stack from a manually mapped image
+
+When the exception stack stops inside the mapped executable, run `mapped_stack.py` on the existing
+private dump. Supply the exact PE from the crashing build and an x64 CDB from Debugging Tools for
+Windows. If CDB is on your PATH, omit `--cdb`. The optional `--symbols` takes one local directory
+containing the matching runtime images and PDBs.
+
+```powershell
+py -3 -I scripts\windows-boot\mapped_stack.py D:\runs\fault\crash.dmp D:\package\title.exe --symbols D:\build\RelWithDebInfo --cdb "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe"
+```
+
+The command derives the mapping base, including a relocated base, by locating a unique captured
+instruction window in an executable section of the supplied PE. It checks for a file-backed x64
+unwind entry at the exception RIP and compares captured bytes from the first header page and that
+function's unwind metadata when available.
+A small dump can establish a local code match only. Use the original image even if another build
+has the same function. Exit-only snapshots, faults outside the supplied image, leaf functions
+without unwind entries, and missing, patched or ambiguous instruction windows cannot establish
+this stack.
+
+CDB reads the exception context and uses the disk image's unwind data to recover callers. The
+script makes a temporary copy of the PE beside the dump under the debugger alias `leonida_mapped`.
+It disables network symbols and writes private frame rows to a new `mapped-stack.txt` beside the
+dump. Use `--output` for a different new file. A successful walk recovers at least one caller and
+can stop when later stack memory or module information is missing. Keep dumps and reports outside
+the checkout and share only the outcome and frame count.
+
+Run the synthetic regression tests with `py -3 -I tests\test_mapped_stack.py`. To include the
+native CDB walk, put x64 CDB on PATH or set `LEONIDA_TEST_CDB` to its full path.

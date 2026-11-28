@@ -2018,6 +2018,12 @@ if(NOT TARGET Vulkan::Headers)
     FetchContent_MakeAvailable(VulkanHeaders)
   endif()
 endif()
+# The Windows runtime's D3D12 layer needs newer headers than the portable Vulkan tools, so only its builds check.
+if(TARGET Vulkan::Headers AND WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
+  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/vulkan_headers_version.cmake")
+  get_target_property(leonida_vk_include_dirs Vulkan::Headers INTERFACE_INCLUDE_DIRECTORIES)
+  leonida_vulkan_headers_version("${leonida_vk_include_dirs}")
+endif()
 if(TARGET Vulkan::Headers)
   # The standalone Khronos releases use glslang; older SDKs also provide glslangValidator.
   find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE NAMES glslangValidator glslang
@@ -4082,6 +4088,10 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_compile_teardown_one_worker COMMAND d3d12_compile_teardown_test)
       set_tests_properties(d3d12_compile_teardown_one_worker PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300
                            ENVIRONMENT "LEONIDA_COMPILE_THREADS=1")
+      # The session file beside an offline seed: loaded alone, the seed not read and nothing merged, when
+      # pipeline_cache.session.seed says it was written beside the seed there now; otherwise the seed and a merge.
+      add_test(NAME d3d12_session_cache_seed COMMAND d3d12_compile_teardown_test --seed)
+      set_tests_properties(d3d12_session_cache_seed PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
       # A buffer at the title's own VA (device slot 133) read by the same shader through a root view and a V#.
       add_executable(d3d12_title_va_test test/d3d12_title_va_test.cpp shims/d3d12_xs_device.cpp
                      test/xmem_geometry_aliases_stub.cpp ${LEONIDA_TEST_CS})

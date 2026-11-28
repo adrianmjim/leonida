@@ -2582,6 +2582,19 @@ def wine_launcher(out: str, work: str, image: str) -> str:
     return f"""#!/bin/sh
 # Starts the Windows build of the loader with Wine. WINE picks another one, e.g. a Proton build's bin/wine.
 here=$(dirname "$(readlink -f "$0")")
+cx_wine=
+if [ -n "${{LEONIDA_CX_BOTTLE:-}}" ]; then
+    cx_default='/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine'
+    cx_wine=$(command -v "${{WINE:-$cx_default}}") || {{
+        printf 'CrossOver Wine not found: %s. Set WINE to its bin/wine.\\n' "${{WINE:-$cx_default}}" >&2
+        exit 1
+    }}
+    # Resolve a relative WINE before changing to the package directory.
+    case $cx_wine in
+        /*) ;;
+        *) cx_wine="$PWD/$cx_wine" ;;
+    esac
+fi
 if [ "$#" -eq 1 ] && {{ [ "$1" = --dry-run ] || [ "$1" = --init ] || [ "$1" = --run ]; }}; then
     game=$(cat "$here/game_path.txt" && printf .) || exit 1
     cd "${{game%.}}" || exit 1
@@ -2593,6 +2606,13 @@ if [ "$#" -eq 1 ] && {{ [ "$1" = --dry-run ] || [ "$1" = --init ] || [ "$1" = --
     # Wine maps the Unix filesystem root to Z:. The game reads from its package and writes to the port's overlay.
 {moved_catalog}    export LEONIDA_D3D12="${{LEONIDA_D3D12:-vulkan}}"
     set -- "$1" "./$image" --overlay "Z:$here/overlay"
+fi
+if [ -n "$cx_wine" ]; then
+    # CrossOver's --cx-app expects a Windows path, even when the executable lives outside the bottle.
+    cx_exe="Z:$(printf '%s' "$here/gta6rt.exe" | tr '/' '\\\\')"
+    export ROSETTA_ADVERTISE_AVX="${{ROSETTA_ADVERTISE_AVX:-1}}"
+    workdir=$(pwd -P) || exit 1
+    exec "$cx_wine" --bottle "$LEONIDA_CX_BOTTLE" --cx-app "$cx_exe" --workdir "$workdir" --no-gui -- "$@"
 fi
 exec "${{WINE:-wine}}" "$here/gta6rt.exe" "$@"
 """

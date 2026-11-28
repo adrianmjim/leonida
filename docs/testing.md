@@ -775,6 +775,11 @@ fail natively; through the fallback `ps_bary` and `ps_persp_bary` pass. `tools/v
 by itself ([#166 entry](https://github.com/ItsNotRexed/Leonida/issues/166#issuecomment-7109387712)). Other GCN 5 GPUs
 are not covered: none has been measured.
 
+The same driver on a Raphael iGPU (Ryzen 7000 desktop, PCI 1002:164E, RDNA 2) also reads a wrong third `BaryCoordKHR`
+component in `ps_bary` (0.992 where 0.0039 is expected) under driver 31.0.22044.1 (Vulkan `driverVersion` 2.0.283, compiler
+23.20.44), and passes through `LEONIDA_BARY_FALLBACK=1`. `barycentric_fallback` is true there only up to and including
+driverVersion 2.0.283; newer drivers keep native barycentrics, and `LEONIDA_BARY_FALLBACK=0` turns the fallback off.
+
 ## Macs: 16-bit interpolation without PerVertexKHR
 
 `ps_interp_f16_high` (and `ms_f16_pack`) normally read 16-bit interpolants through `PerVertexKHR` inputs, which
@@ -902,6 +907,7 @@ game's device ignores it`, so leaving them set cannot slow a game down (`run_tin
 | Every test crashes inside `libnvidia-eglcore.so` | NVIDIA's 535 server driver (Ubuntu 24.04's default) | Use driver 615 or newer |
 | `build.py`: 0 translated, reason `.text` | An old `build.py` with LLVM 19 | Update to current `main` |
 | `vk_harness` doesn't compile: `VK_KHR_maintenance8` names unknown | Vulkan headers older than the SDK the code was written against | Update to current `main` (the code now builds without it), or use current Khronos Vulkan-Headers; conda-forge's package is too old |
+| Configure stops with "Vulkan headers too old: ... VK_HEADER_VERSION N" (before: the build stopped at `d3d12_com.h(42): error C3646: 'calibrated': unknown override specifier` and 100+ errors in `d3d12_vulkan_device.cpp`, or at `VkPhysicalDevicePipelineBinaryFeaturesKHR` in `vk_harness.cpp`) | The Windows runtime found Vulkan headers older than v1.3.294 (`runtime/cmake/vulkan_headers_version.cmake`). conda-forge's `vulkan-headers` resolves to 1.3.231 next to `llvm-tools`. Measured on MSVC 14.51: v1.3.294 builds every target, SDK 1.3.280.0 all but `vk_harness` (`VK_KHR_pipeline_binary` is new in v1.3.294), 1.3.231 stops in the D3D12 layer | Point `VULKAN_SDK` at a Vulkan SDK from 1.3.296.0 on or current Khronos Vulkan-Headers, then delete `CMakeCache.txt`; or pass `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` with no other headers installed |
 | `ps_bary` and `ps_uniform_branch` fail by about 0.9 | The GPU runs pixel shaders wave64 without fragment barycentrics (GCN3 and RDNA1 on RADV), or an old AMD Windows driver (22.40) | Current `main` skips them on such devices; on Windows, update the driver |
 | `ps_bary`, `ps_persp_bary` and `ps_ij_computed` read the third barycentric as about 0.99 on a gfx90c iGPU (Vega 8, AMD Windows driver 31.0.21921.13001; #5933) | The driver's native `BaryCoordKHR` is wrong there: the same tests pass through `--bary-fallback`, and natively on RADV (Radeon 8060S) | `tools/vk_subgroup_info.py` turns the fallback on by itself for gfx90c under AMD's driver, and `make_game.py`, `run_gpu_tests.py`, `build.py` and `check.py` follow it when `LEONIDA_BARY_FALLBACK` is unset; `=1` forces the fallback and `=0` forces native barycentrics, where they still fail |
 | `cs_w32_salu64` gives eight wrong words on RDNA1 under RADV Mesa 25.2.8 (`0x1E6A2C48 0x1234 0 0x100 47 48 0xFFFF8000 0xFFFFFFFE`, where word 2 should be `0xFFFFFFFF`) | Only the high word of the `s_bfe_i64` result is wrong. The same words appear on four pinned V540s (Navi 12, PCI `1002:7360`) and on a clean upstream/main worktree, and three different valid SPIR-V sign-extension formulations give the same result while the CPU interpreter matches, so this is the driver version rather than the translator (SHADER-276) | Expected with Mesa 25.2.8; the fixture passes on NVIDIA and on AMD's Windows driver. Try a newer Mesa before treating it as a translator bug; do not weaken the fixture's expectation |

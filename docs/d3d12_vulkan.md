@@ -2776,6 +2776,23 @@ Pipeline creation:
   Replacing part of the previous file would corrupt it.
   `LEONIDA_PIPELINE_CACHE_BYTES` caps what a session adds, at a checkpoint or at teardown (an offline `pipeline_cache.bin` seed, which the driver hands back as part of the union, is not counted; 4 GiB by default, zero disables
   the session file).
+  With an offline seed the session file is the driver's whole union, the seed's pipelines and the session's together:
+  with a 1.88 GB seed on an RX 7900 XT it came back 0.1 to 6 MB larger, so loading the seed and then merging the
+  session file built two 1.9 GB driver caches at every launch (private commit 8.1 -> 9.95 -> 8.3 GB in the first
+  20 s). So each time the session file is published beside a seed this device loaded, a small
+  `pipeline_cache.session.seed` next to it records that seed's size and last-write time and the session file's own
+  size (`runtime/src/pipeline_cache_store.h`, `SessionSeed`); a session file published without one removes it. At
+  launch, when the record matches the `pipeline_cache.bin` there now, the session file still has the size recorded and
+  is at least the seed's size, and its header names this device, the cache is created from the session file alone:
+  `pipeline_cache.bin` is not read and nothing is merged (one line says so; the save limit still counts what a session
+  adds to the seed). A new or touched seed, a missing or damaged record, a session file whose size differs from the
+  record (another build wrote it since), or a blob the driver declines falls back to loading the seed and merging the
+  session file into it. A session file written back smaller than the blob its cache was created from removes the
+  record instead of writing it (`may_record_session_seed`): the driver's union does not shrink, so entries were lost on
+  the way, and the next launch loads the seed again to put them back. Nothing is skipped or deleted but a stale
+  record. `LEONIDA_SESSION_CACHE_DIRECT_SEED=0`, or `LEONIDA_DIRECT_SESSION_CACHE=0`, always loads the seed and merges
+  (the record is still written); with `LEONIDA_PIPELINE_CACHE_BYTES=0`, `pipeline_cache.session.bin` and
+  `pipeline_cache.session.seed` are neither read nor written (the seed still loads).
   The session file can't keep a crashed run's compiles: it is written at teardown and at the optional checkpoints
   below only. The heavy pipeline cache (RT-HEAVY-PIPELINE-CACHE, `runtime/src/heavy_pipeline_cache.h`) keeps the graphics ones; compute pipelines go to the per-pipeline journal
   described below. Every graphics build first asks the corpus cache with
