@@ -11152,7 +11152,8 @@ VkImage DeviceState::zero_sampled_image(const D3D12_RESOURCE_DESC& d, const Form
         return VK_NULL_HANDLE;
     }
     if (retry != zero_image_retry.end()) zero_image_retry.erase(retry);
-    // The shared images are never released, so a shape past the limit stays past it.
+    // A shape past the limit is left without an image (an empty entry) until room frees: release_zero_image drops the
+    // empty entries when it releases an image, so the shape gets another try.
     if (zero->image_backing_bytes() > limit - used) {
         zero->Release();
         zero_images.emplace(key, nullptr);
