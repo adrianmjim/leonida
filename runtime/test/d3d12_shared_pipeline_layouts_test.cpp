@@ -5,6 +5,7 @@
 //   - 64 PSOs of each shape (graphics and compute, each with and without set-0 bindings; the set-0 ones only where
 //     the device has the bindless set), made on four threads at once: one layout per shape;
 //   - the PSOs released with the device alive: no layout destroyed; new PSOs of the same shapes: no layout made;
+//   - a dispatch with a shared layout (set 0 bound, constants pushed) run before its PSO and the device go;
 //   - the device released: every layout it made destroyed exactly once, and nothing destroyed twice or unknown;
 //   - a second device makes its own layouts, and destroys them at its teardown.
 // With LEONIDA_LAZY_PIPELINES=0 and LEONIDA_LAZY_COMPUTE=0 (the _eager test) every pipeline is built at creation with
@@ -365,6 +366,35 @@ bool run(const Setup& setup) {
             }
         CHECK(creates() == again_before);
         release(again);
+
+        // A dispatch that binds set 0 and pushes constants with a shared layout, run before its PSO and then the
+        // device are released (D3D12 asks the title to wait for the GPU before it releases a PSO it used), so
+        // validation sees the shared layout used by a command buffer and destroyed at the device's teardown.
+        Ref<ID3D12CommandQueue> queue;
+        Ref<ID3D12CommandAllocator> allocator;
+        Ref<ID3D12GraphicsCommandList> list;
+        Ref<ID3D12Fence> fence;
+        {
+            Ref<ID3D12PipelineState> pso;
+            pso.p = make_pso(dev.p, root.p, setup.has(compute_set0) ? compute_set0 : compute_plain, 0);
+            CHECK(pso.p);
+            CHECK(creates() == again_before);
+            const D3D12_COMMAND_QUEUE_DESC queue_desc{};
+            CHECK(SUCCEEDED(dev->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+            CHECK(SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+            CHECK(SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, pso.p,
+                                                   IID_PPV_ARGS(&list.p))));
+            list->SetComputeRootSignature(root.p);
+            list->SetComputeRoot32BitConstant(0, 7, 0);
+            list->Dispatch(1, 1, 1);
+            CHECK(list->Close() == S_OK);
+            ID3D12CommandList* lists[] = {list.p};
+            queue->ExecuteCommandLists(1, lists);
+            CHECK(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            CHECK(SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+            CHECK(SUCCEEDED(queue->Signal(fence.p, 1)));
+            CHECK(SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
+        }
         root.reset();
         CHECK(watched(0) == setup.shapes);
     }  // the device's last reference: its teardown

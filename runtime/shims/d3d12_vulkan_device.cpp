@@ -2919,12 +2919,15 @@ struct DeviceState {
             key.push_back(range.size);
         }
         std::lock_guard lock(pipeline_layout_mutex);
-        if (const auto it = pipeline_layouts.find(key); it != pipeline_layouts.end()) return it->second;
-        VkPipelineLayout layout = VK_NULL_HANDLE;
-        if (context->vk.vkCreatePipelineLayout(info.device, &create, nullptr, &layout) != VK_SUCCESS)
+        // The map entry first, then the layout: a layout made and then lost to a failed insert would be in no map,
+        // and destroy_pipeline_layouts would never free it.
+        const auto [it, inserted] = pipeline_layouts.try_emplace(std::move(key), VK_NULL_HANDLE);
+        if (!inserted) return it->second;
+        if (context->vk.vkCreatePipelineLayout(info.device, &create, nullptr, &it->second) != VK_SUCCESS) {
+            pipeline_layouts.erase(it);
             return VK_NULL_HANDLE;
-        pipeline_layouts.emplace(std::move(key), layout);
-        return layout;
+        }
+        return it->second;
     }
     std::size_t pipeline_layout_count() {
         std::lock_guard lock(pipeline_layout_mutex);
