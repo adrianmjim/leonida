@@ -1233,7 +1233,7 @@ struct Hosted {
     state: u32,
     clear: Option<[u32; 5]>,
     /// When the host copy was last asked for (`crate::host::moment`),
-    /// written under `made`'s lock.
+    /// written under `made`'s lock; 0 while there is none to let go.
     used: std::sync::atomic::AtomicU64,
     /// The host refused to make it: not tried again.
     refused: std::sync::atomic::AtomicBool,
@@ -1391,6 +1391,9 @@ pub(crate) fn want_level(this: This, first: u32) {
     if let Some(old) = made.take() {
         REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
     }
+    // No copy to let go now: the sweep passes it by until a use makes the
+    // next one (`hosted` stamps it then), as in `let_go_idle`.
+    r.host.used.store(0, Relaxed);
 }
 
 /// Counts for the memory line: host copies of textures the title fills
@@ -2200,6 +2203,8 @@ pub(crate) fn let_go_idle() {
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+    // The walk and the sort below are part of what a look costs.
+    let began = std::time::Instant::now();
     let all = textures();
     // With a limit, the longest idle first.
     let mut by_age: Vec<(u64, usize)> = Vec::new();
@@ -2231,7 +2236,6 @@ pub(crate) fn let_go_idle() {
     };
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
-    let began = std::time::Instant::now();
     // Lets go of the host copy of the texture at `at` if it has been out of
     // use for `ms` and `frames` and only its title texture holds it: its
     // bytes, if it went.
@@ -2244,6 +2248,7 @@ pub(crate) fn let_go_idle() {
         if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, ms, frames) || crate::texture::host_wrote(at) {
             return None;
         }
+        SWEPT_LOCKED.fetch_add(1, Relaxed);
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
@@ -2256,7 +2261,14 @@ pub(crate) fn let_go_idle() {
                 // state of the texture let go (it says "uploaded").
                 crate::texture::unstage(at as This);
                 r.host.wanted.store(u32::MAX, Relaxed);
-                made.take()
+                let taken = made.take();
+                // Nothing left to let go: passed by above until a use makes
+                // a copy again and stamps it (`hosted`). A placed texture
+                // stays in the table for the run, and with its last use
+                // kept each look under pressure sorted it and took its lock
+                // again: 18,639 of them after nine minutes of run 24.
+                r.host.used.store(0, Relaxed);
+                taken
             } else {
                 None
             }
@@ -2417,6 +2429,11 @@ fn idle_rank(used: u64, remade: u32) -> u64 {
 /// longest one's.
 #[cfg(windows)]
 pub(crate) static SWEPT_US: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Since the start: textures the looks of [`let_go_idle`] took the lock of
+/// (a count, kept apart from the times above).
+#[cfg(windows)]
+pub(crate) static SWEPT_LOCKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// For the memory line: the host copies the sweep never lets go
 /// ([`let_go_idle`] takes only copies of textures the title fills that the
@@ -5181,6 +5198,81 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    /// A placed texture whose host copy the sweep let go stays in the
+    /// table for the run; the next looks pass it by without its lock, also
+    /// while the card is short of room and the longest idle are sorted. So
+    /// does one whose copy `want_level` replaced and nothing used since. In
+    /// a process of its own, since `LEONIDA_TEXTURE_BUDGET_MB` is read once.
+    #[cfg(windows)]
+    #[test]
+    fn a_gone_copy_is_not_looked_at_again() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const CHILD: &str = "LEONIDA_GONE_COPY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            if crate::host::host().is_none() {
+                return;
+            }
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "resource::tests::a_gone_copy_is_not_looked_at_again", "--nocapture"])
+                .env(CHILD, "1")
+                .env("LEONIDA_TEXTURE_BUDGET_MB", "1")
+                .env_remove("LEONIDA_TEXTURE_SWEEP")
+                .env_remove("LEONIDA_TEXTURE_KEEP")
+                .env_remove("LEONIDA_COMMIT_FLOOR")
+                .env_remove("LEONIDA_HELD_LEVELS")
+                .env_remove("LEONIDA_LEVELS_ON_DEMAND")
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && text.contains("gone copy: ran"),
+                "the run with a budget of 1 MB failed:\n{text}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        if crate::host::host().is_none() {
+            return;
+        }
+        assert!(held_only(), "levels kept from the one viewed");
+        // 1024x1024 BC7, eleven levels: over the 1 MB limit alone.
+        let desc = [3u32, 0, 0, 0, 1024, 0, 1024, 0xb_0001, 98, 1, 0, 0x105, 0, 0];
+        let whole = placed_bytes(&desc).unwrap() as usize;
+        let place = || {
+            // SAFETY: memory of our own that stays.
+            let at = unsafe { VirtualAlloc(std::ptr::null(), whole, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+            texture_at(at as u64, &desc).unwrap()
+        };
+        let (gone, kept, grown) = (place(), place(), place());
+        // (The first tenth of a second of frame 0 is the moment 0: no use.)
+        crate::frame::test_advance();
+        // The one held keeps the card short of room for both looks.
+        let held = host_copy(kept).unwrap();
+        drop(host_copy(gone).unwrap());
+        // A copy from level 2, used once, as long ago as the one let go.
+        want_level(grown, 2);
+        assert_eq!(host_copy(grown).unwrap().base, 2);
+        // Long enough ago: four frames and the 1.5 s of a card short of room.
+        for _ in 0..4 {
+            crate::frame::test_advance();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1_800));
+        // A view from level 0 replaces it; nothing makes the next one, so
+        // it has no copy to let go either.
+        want_level(grown, 0);
+        assert!(made_copy(grown).is_none(), "the copy was replaced");
+        let _ = host_copy(kept);
+        let_go_idle();
+        assert!(made_copy(gone).is_none(), "the idle copy went");
+        let locked = SWEPT_LOCKED.load(Relaxed);
+        let _ = host_copy(kept);
+        let_go_idle();
+        assert_eq!(SWEPT_LOCKED.load(Relaxed), locked, "a texture without a copy was looked at again");
+        assert!(std::sync::Arc::ptr_eq(&held, &made_copy(kept).unwrap()));
+        println!("gone copy: ran");
     }
 
     /// A placed texture viewed from a later level has a host copy of that

@@ -11598,7 +11598,7 @@ impl Meter {
                      levels viewed alone ({} MB on the card, {} MB of title memory whole), {grown} replaced by one with more levels, \
                      {flipped} slots made from their new view after its upload had run ({missed} written again first); {} uploads left \
                      out as the host copy held those bytes (LEONIDA_TEXTURE_SAME=0: made); {} MB of texture blocks free; \
-                     {} looks for textures to let go, {:.2} ms each, the longest {:.1}",
+                     {} looks for textures to let go, {:.2} ms each, the longest {:.1}, {} textures looked at under their lock",
                     bytes >> 20,
                     whole >> 20,
                     crate::draw::HEAP_TEXTURES_SAME.load(Ordering::Relaxed),
@@ -11607,7 +11607,8 @@ impl Meter {
                     crate::resource::SWEPT_US[1].load(Ordering::Relaxed) as f64
                         / 1e3
                         / crate::resource::SWEPT_US[0].load(Ordering::Relaxed).max(1) as f64,
-                    crate::resource::SWEPT_US[2].load(Ordering::Relaxed) as f64 / 1e3
+                    crate::resource::SWEPT_US[2].load(Ordering::Relaxed) as f64 / 1e3,
+                    crate::resource::SWEPT_LOCKED.load(Ordering::Relaxed)
                 );
             }
             {
