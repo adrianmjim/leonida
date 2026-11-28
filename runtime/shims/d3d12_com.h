@@ -431,6 +431,13 @@ struct ImageMemoryStats {
     std::uint64_t textures = 0;
 };
 ImageMemoryStats image_memory_stats(ID3D12Device* device);
+// The shared zero images a device keeps for placed BC textures with no memory of their own yet (one per shape) and
+// their bytes, which count against the 256 MiB they may take. For tests.
+struct SharedZeroImages {
+    std::uint64_t images = 0;
+    std::uint64_t bytes = 0;
+};
+SharedZeroImages shared_zero_images(ID3D12Device* device);
 
 // The bindless set 0 a device with VulkanDeviceInfo::bindless keeps (vulkan_bindless.h), and its layout: what a
 // pipeline whose shader declares set-0 bindings is created with and binds. Null without such a set. The set is

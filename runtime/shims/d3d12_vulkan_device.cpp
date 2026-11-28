@@ -8053,6 +8053,37 @@ struct DeviceState {
     std::map<ZeroShape, ZeroImageRetry> zero_image_retry;
     std::atomic<VkDeviceSize> zero_image_bytes{0};
     VkImage zero_sampled_image(const D3D12_RESOURCE_DESC&, const Format&, VkDeviceSize);
+    // How many placed textures show each shape's shared image (Resource::shared_zero_). The images sit in host
+    // memory on a discrete GPU and count against the 256 MiB, so one no texture shows any more is released
+    // (release_zero_image) rather than kept for the device's life. Taken before zero_image_mutex.
+    std::mutex zero_user_mutex;
+    std::map<ZeroShape, std::size_t> zero_image_users;  // under zero_user_mutex
+    VkImage acquire_zero_image(const D3D12_RESOURCE_DESC&, const Format&, VkDeviceSize);
+    void release_zero_image(const D3D12_RESOURCE_DESC&, VkImage);
+    // A texture that got memory of its own gives its claim back here instead: it gets it inside command prepare, with
+    // the context's resource lock held (VulkanContext::resolve), where releasing the image would take that lock again
+    // and the user and image locks would be taken after it. Given back before a later submission (before_execute),
+    // once every ExecuteCommandLists replay in progress at the return has recorded its submissions: the replay that
+    // made it may already have commands that sample the image, and so may another queue's, whose views of it were
+    // resolved before they were forgotten. A replay of another queue starting meanwhile drains the returns before
+    // those submissions have their tickets; the image's deferred deletion (submitted ticket + 1 then) would be due
+    // when that queue's own submission completes, with theirs still pending. A return waits as a retired geometry
+    // view does (GeometryViews::kAfterExecutes): `epoch` is the last replay begun when it was made.
+    struct ZeroReturn {
+        D3D12_RESOURCE_DESC desc;
+        VkImage image;
+        std::uint64_t epoch;
+    };
+    std::mutex zero_return_mutex;  // taken last but for GeometryViews' execute_mutex_ (a leaf)
+    std::vector<ZeroReturn> zero_returns;  // under zero_return_mutex
+    std::atomic<bool> zero_returns_pending{false};
+    void return_zero_image(const D3D12_RESOURCE_DESC& d, VkImage image) {
+        std::lock_guard lock(zero_return_mutex);
+        // The texture's views of the image are forgotten already: a replay begun after this read cannot name them.
+        zero_returns.push_back({d, image, geometry.execute_epoch()});
+        zero_returns_pending.store(true, std::memory_order_release);
+    }
+    void drain_zero_returns();
     std::multimap<std::uint64_t, leonida::DescriptorKey> image_keys;  // by the texture's address
     std::vector<ImageEntry> replaced_images;  // kept until their texture goes: work in flight may still use them
     std::map<leonida::DescriptorKey, VkSampler> sampler_entries;
@@ -9272,6 +9303,9 @@ public:
         if (memory_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::device_memory, memory_);
         if (image_range_)
             device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_memory, image_range_.release());
+        // After forget_image: this texture's views of the shared image are queued for deletion before the image.
+        // Not again when it gave its claim back on getting memory of its own (publish_streamed_texture).
+        if (zero_claim_.exchange(false)) device_.release_zero_image(desc_, shared_zero_);
     }
 
     VkDeviceAddress indexed_bda_{};
@@ -10030,8 +10064,10 @@ public:
             desc_.SampleDesc.Count == 1 && asked_castable.empty() && !format.typeless &&
             leonida::block_format(format.format, format.aspects).block > 1) {
             VkMemoryRequirements footprint{};
-            if (device_.memory_requirements(info, footprint))
-                shared_zero_ = device_.zero_sampled_image(desc_, format, footprint.size);
+            if (device_.memory_requirements(info, footprint)) {
+                shared_zero_ = device_.acquire_zero_image(desc_, format, footprint.size);
+                zero_claim_ = shared_zero_ != VK_NULL_HANDLE;
+            }
         }
         std::uint32_t plain_bits = 0;
         if (stage_title && (!shared_zero_ || no_host_copy) && allow_staged_title && origin != TitleImageOrigin::ordinary &&
@@ -10060,6 +10096,8 @@ public:
             image_ = VK_NULL_HANDLE;
             memory_ = VK_NULL_HANDLE;
             staged_title_ = false;
+            // No view of it was made yet; the retry below takes it again if it still fits.
+            if (zero_claim_.exchange(false)) device_.release_zero_image(desc_, shared_zero_);
             shared_zero_ = VK_NULL_HANDLE;
             log_once("no room for a staged title image; retrying host-copyable backing, format", int(info.format));
             return create_texture(format, asked_castable, origin, false);
@@ -10278,7 +10316,13 @@ public:
         }
         const auto owner = device_.images_by_address.find(image_address_);
         if (owner != device_.images_by_address.end() && owner->second == this) {
-            if (ready.zero) device_.forget_image_views_locked(image_address_);
+            if (ready.zero) {
+                device_.forget_image_views_locked(image_address_);
+                // Every view of the shared image is queued for deletion and no pending key leads to it any more: the
+                // texture's claim on it is given back (drain_zero_returns), so it does not stay pinned in host memory
+                // and in the 256 MiB for as long as this texture lives.
+                if (!from && zero_claim_.exchange(false)) device_.return_zero_image(desc_, shared_zero_);
+            }
             for (const auto& [words, image] : ready.keys)
                 device_.bind_image_locked(words, image, image_, format_, aspects_, false, has_view_format_list(),
                                           uint_backed_);
@@ -11059,6 +11103,9 @@ private:
     std::array<std::unique_ptr<Resource>, 2> storage_planes_;  // Xbox depth/stencil UAV, by plane
     bool console_d16s8_ = false;  // created from Xbox format 118 (even when pc_format made it D24S8)
     VkImage shared_zero_ = VK_NULL_HANDLE;  // owned by the device
+    // This texture still counts as a user of shared_zero_ (DeviceState::zero_image_users). shared_zero_ itself stays
+    // set once the claim is given back: descriptor_image and deferrable_sample answer by it.
+    std::atomic<bool> zero_claim_{false};
     std::unique_ptr<leonida::DeferredImageBinding> deferred_attachment_;
     std::atomic<bool> replay_seen_{false};
     bool staged_title_ = false;
@@ -11115,6 +11162,58 @@ VkImage DeviceState::zero_sampled_image(const D3D12_RESOURCE_DESC& d, const Form
     zero_images.emplace(key, zero);
     zero_image_bytes.fetch_add(zero->image_backing_bytes(), std::memory_order_relaxed);
     return zero->image();
+}
+
+// The shape's shared image for one more placed texture, which gives it back with release_zero_image.
+VkImage DeviceState::acquire_zero_image(const D3D12_RESOURCE_DESC& d, const Format& format, VkDeviceSize bytes) {
+    std::lock_guard lock(zero_user_mutex);  // a release of the shape's last user cannot run between the two
+    const VkImage image = zero_sampled_image(d, format, bytes);
+    if (image) ++zero_image_users[ZeroShape{d.Format, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels}];
+    return image;
+}
+
+// A placed texture no longer shows the shared image of its shape. With no other user the image leaves the map and its
+// bytes leave the 256 MiB; the Resource's own destructor queues it for deletion after the submissions made so far, as
+// the views of it queued before. The shapes left without an image because they did not fit get another try too.
+void DeviceState::release_zero_image(const D3D12_RESOURCE_DESC& d, VkImage image) {
+    const ZeroShape key{d.Format, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels};
+    Resource* gone = nullptr;
+    {
+        std::lock_guard users_lock(zero_user_mutex);
+        const auto users = zero_image_users.find(key);
+        if (users == zero_image_users.end() || --users->second) return;
+        zero_image_users.erase(users);
+        std::lock_guard lock(zero_image_mutex);
+        const auto it = zero_images.find(key);
+        if (it == zero_images.end() || !it->second || it->second->image() != image) return;
+        gone = it->second;
+        zero_images.erase(it);
+        zero_image_bytes.fetch_sub(gone->image_backing_bytes(), std::memory_order_relaxed);
+        // Each entry with an image has a user: more entries than users means some shapes were left without one.
+        if (zero_images.size() > zero_image_users.size())
+            std::erase_if(zero_images, [](const auto& entry) { return !entry.second; });
+    }
+    gone->Release();  // outside the locks: its destructor takes the descriptor and context locks
+}
+
+// The claims textures gave back on getting memory of their own (return_zero_image) once no replay in progress at the
+// return is left. Called before each submission, outside the context's resource lock; the images released here are
+// deleted after the submissions made so far, which include every submission of those replays.
+void DeviceState::drain_zero_returns() {
+    if (!zero_returns_pending.load(std::memory_order_acquire)) return;
+    std::vector<ZeroReturn> due;
+    {
+        std::lock_guard lock(zero_return_mutex);
+        // Read under the lock: every return looked at was made before it. kAfterExecutes with no replay in progress.
+        const std::uint64_t oldest = geometry.oldest_execute();
+        std::erase_if(zero_returns, [&](const ZeroReturn& r) {
+            if (r.epoch >= oldest) return false;
+            due.push_back(r);
+            return true;
+        });
+        zero_returns_pending.store(!zero_returns.empty(), std::memory_order_relaxed);
+    }
+    for (const ZeroReturn& r : due) release_zero_image(r.desc, r.image);
 }
 
 
@@ -15699,6 +15798,7 @@ public:
                 full = refreshed_present_.exchange(serial, std::memory_order_relaxed) != serial;
             }
             state_.drain_geometry_releases();
+            state_.drain_zero_returns();
             state_.refresh_shadows(full || per_frame < 2, full);
             state_.retire_orphan_windows();
             // LEONIDA_GEOMETRY_ASYNC=1 (for runs that only need the title to go on): the geometry copies are brought
@@ -22932,6 +23032,19 @@ ImageMemoryStats image_memory_stats(ID3D12Device* device) {
     if (!d || !d->state().image_memory) return {};
     const auto stats = d->state().image_memory->stats();
     return {stats.blocks, stats.block_bytes, stats.ranges};
+}
+
+SharedZeroImages shared_zero_images(ID3D12Device* device) {
+    if (!device) return {};
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    auto* d = Device::from<Device>(real ? real : device);
+    if (!d) return {};
+    auto& state = d->state();
+    SharedZeroImages out;
+    std::lock_guard lock(state.zero_image_mutex);
+    for (const auto& [shape, image] : state.zero_images) out.images += image != nullptr;
+    out.bytes = state.zero_image_bytes.load(std::memory_order_relaxed);
+    return out;
 }
 
 bool read_arena(ID3D12Device* device, std::uint64_t va, void* out, std::size_t bytes) {
