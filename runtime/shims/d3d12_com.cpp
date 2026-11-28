@@ -269,8 +269,8 @@ public:
         if (!list_.reset()) return d3d12_trace::result(method, E_FAIL);  // D3D12 resets only closed lists
         record_into(command_allocator);
         invalid_ = false;
-        calls_.clear();
-        tables_.clear();
+        calls_storage_.clear(calls_);
+        tables_storage_.clear(tables_);
         directly_indexed_ = false;
         release_held();  // what the old recording used: it was replayed at ExecuteCommandLists
         reset_state(state);  // Reset returns every list state to its default
@@ -1597,6 +1597,7 @@ private:
     leonida::IndexBufferView index_{};
     // SetGraphicsRootDescriptorTable / SetComputeRootDescriptorTable: VA, CBV/SRV/UAV slots the signature declares
     std::vector<std::pair<std::uint64_t, std::uint32_t>> tables_;
+    leonida::RecordingStorage tables_storage_;  // Reset releases a one-off huge recording's tables (command_list.h)
     bool directly_indexed_ = false;
     // The span a root view may read: D3D12's largest constant buffer (4096 x 16 bytes).
     static constexpr std::uint64_t kRootViewBytes = 65536;
@@ -1634,6 +1635,7 @@ private:
         std::function<void(GraphicsCommandList&)> run;
     };
     std::vector<BundleCall> calls_;
+    leonida::RecordingStorage calls_storage_;
 
     // Every deferred call replays through a private member that does not trace: the trace line is written once, when
     // the application makes the call, and not again at each ExecuteBundle. After Close nothing is appended, since

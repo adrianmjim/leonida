@@ -724,6 +724,30 @@ inline DrawCommandView draw_command(const Command& command) noexcept {
     return {};
 }
 
+// Clears a vector that each recording of a reused list fills again. clear() alone keeps the capacity of the largest
+// recording for the list's whole life, and an application keeps its lists for the whole run, so one huge recording
+// (every Command is as large as a Draw, 320 bytes on MSVC x64, barriers included) would stay allocated. The storage
+// is released only when it is over 1 MiB and more than 4 times a high-water mark that decays by an eighth per
+// recording: a list recording about the same amount each time, or alternating a large and a small recording, keeps
+// its buffer and does not reallocate; a one-off peak goes after about ten smaller recordings. A large recording that
+// comes back less often than that is released and grown again each time: a bounded copy, traded for not keeping
+// every peak.
+class RecordingStorage {
+public:
+    template <class T>
+    void clear(std::vector<T>& recording) {
+        high_ = std::max(recording.size(), high_ - high_ / 8);
+        if (recording.capacity() > 4 * high_ && recording.capacity() * sizeof(T) > release_bytes)
+            std::vector<T>().swap(recording);
+        else
+            recording.clear();
+    }
+
+private:
+    static constexpr std::size_t release_bytes = std::size_t(1) << 20;
+    std::size_t high_ = 0;
+};
+
 class CommandList {
 public:
     // D3D12 split barriers: the begin half only marks the resource unusable until the end half, so the transition
@@ -981,7 +1005,7 @@ public:
 
     bool reset() {
         if (!closed_) return false;
-        commands_.clear();
+        commands_storage_.clear(commands_);
         active_.clear();
         closed_ = false;
         stamp_.restamp();
@@ -1026,6 +1050,7 @@ private:
     }
 
     std::vector<Command> commands_;
+    RecordingStorage commands_storage_;
     std::vector<BeginQuery> active_;  // queries begun and not yet ended
     bool closed_ = false;
     command_list_epochs::Stamp stamp_;  // when this recording began: a copy the layer retires waits for it

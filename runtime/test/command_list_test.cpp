@@ -1,6 +1,42 @@
 #include "../src/command_list.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <new>
+
+// The heap this test holds, counted by replacing the global allocator: how much a reused list keeps between
+// recordings is read without a capacity accessor on CommandList.
+namespace {
+std::size_t heap_bytes = 0;
+// Allocations of 1 KiB or more: the commands vector growing, not the epoch registry's node each reset adds.
+std::size_t heap_allocations = 0;
+
+void* counted_alloc(std::size_t size) {
+    void* block = std::malloc(size + 16);
+    if (!block) throw std::bad_alloc();
+    std::memcpy(block, &size, sizeof size);
+    heap_bytes += size;
+    if (size >= 1024) ++heap_allocations;
+    return static_cast<char*>(block) + 16;
+}
+
+void counted_free(void* pointer) noexcept {
+    if (!pointer) return;
+    void* block = static_cast<char*>(pointer) - 16;
+    std::size_t size;
+    std::memcpy(&size, block, sizeof size);
+    heap_bytes -= size;
+    std::free(block);
+}
+}  // namespace
+
+void* operator new(std::size_t size) { return counted_alloc(size); }
+void* operator new[](std::size_t size) { return counted_alloc(size); }
+void operator delete(void* pointer) noexcept { counted_free(pointer); }
+void operator delete[](void* pointer) noexcept { counted_free(pointer); }
+void operator delete(void* pointer, std::size_t) noexcept { counted_free(pointer); }
+void operator delete[](void* pointer, std::size_t) noexcept { counted_free(pointer); }
 
 #define CHECK(condition) do {                                    \
     if (!(condition)) {                                          \
@@ -372,5 +408,71 @@ int main() {
     CHECK(!list.acceleration_structure_postbuild({0x4000, 0, {0x1080}}));
     CHECK(list.close());
     CHECK(list.commands().size() == 7);
+
+    // An application keeps its lists and resets them for the whole run. A one-off huge recording (a loading
+    // screen, a capture) does not keep its storage once the recordings after it stay far smaller...
+    Draw draw;
+    draw.pipeline = 1;
+    draw.count = 3;
+    draw.instances = 1;
+    const auto record = [&](CommandList& recording, std::size_t draws) {
+        for (std::size_t i = 0; i < draws; ++i)
+            if (!recording.draw(draw)) return false;
+        return recording.close();
+    };
+    {
+        const std::size_t before = heap_bytes;
+        CommandList pooled;
+        CHECK(record(pooled, 200000));
+        CHECK(heap_bytes - before >= 200000 * sizeof(Command));
+        for (int i = 0; i < 16; ++i) {
+            CHECK(pooled.reset());
+            CHECK(record(pooled, 100));
+        }
+        CHECK(pooled.commands().size() == 100);
+        CHECK(heap_bytes - before < (std::size_t(1) << 20));
+    }
+    // ...while a list recording the same amount each time keeps its buffer: no allocation after the first recording.
+    {
+        CommandList steady;
+        CHECK(record(steady, 10000));  // a few MiB of commands, above the size a list may keep regardless
+        const std::size_t allocations = heap_allocations;
+        for (int i = 0; i < 32; ++i) {
+            CHECK(steady.reset());
+            CHECK(record(steady, 10000));
+        }
+        CHECK(heap_allocations == allocations);
+    }
+    // A list that alternates a large and a small recording (two passes a frame) keeps the large one's buffer too.
+    {
+        CommandList alternating;
+        CHECK(record(alternating, 20000));
+        const std::size_t allocations = heap_allocations;
+        for (int i = 0; i < 16; ++i) {
+            CHECK(alternating.reset());
+            CHECK(record(alternating, 100));
+            CHECK(alternating.reset());
+            CHECK(record(alternating, 20000));
+        }
+        CHECK(heap_allocations == allocations);
+    }
+    // The D3D12 list's descriptor-table and bundle-call side tables go through the same helper with small entries
+    // (16 bytes for a table): the 1 MiB floor counts bytes, not entries, so 50k tables (800 KB) stay however small
+    // the recordings after them, and 200k (3.2 MB) go.
+    {
+        using Table = std::pair<std::uint64_t, std::uint32_t>;
+        const auto after_small_recordings = [](std::size_t peak) {
+            RecordingStorage storage;
+            std::vector<Table> tables(peak);
+            storage.clear(tables);
+            for (int i = 0; i < 16; ++i) {
+                tables.resize(10);
+                storage.clear(tables);
+            }
+            return tables.capacity();
+        };
+        CHECK(after_small_recordings(50000) == 50000);
+        CHECK(after_small_recordings(200000) * sizeof(Table) < (std::size_t(1) << 20));
+    }
     return 0;
 }
