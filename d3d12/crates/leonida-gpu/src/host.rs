@@ -1465,6 +1465,13 @@ const BATCHES: u32 = 8;
 /// ([`HostList::idle_trim`]): what most frames' executions fit in.
 const IDLE_INDIRECT_MOST: u64 = 1 << 20;
 
+/// Since the last frame-rate line: indirect scratch buffers past
+/// [`IDLE_INDIRECT_MOST`] idle lists let go, and their bytes. Each is made
+/// again by the next list that needs that much, so a count near one a frame
+/// says a title runs such an execution every frame and pays a buffer for it
+/// each time.
+static IDLE_INDIRECT_TRIMS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     /// With when it was made ([`now_ms`]): [`allocator_trim`] takes an old
@@ -2607,6 +2614,21 @@ fn batch_scratch_line(frames: f64) {
         b[3] as f64 / frames,
         (kept as u64 * BATCH_SCRATCH) as f64 / (1 << 20) as f64,
         if batch_pool() { "on" } else { "off" }
+    );
+}
+
+/// For the frame-rate line: what [`HostList::idle_trim`] let go per frame,
+/// if anything.
+fn idle_indirect_line(frames: f64) {
+    let t: Vec<u64> = IDLE_INDIRECT_TRIMS.iter().map(|t| t.swap(0, Ordering::Relaxed)).collect();
+    if t[0] == 0 {
+        return;
+    }
+    tracing::info!(
+        "indirect scratch buffers past 1 MiB let go by idle host lists per frame: {:.2}, {:.2} MB of the card's memory \
+         (each made again by the next list that needs it)",
+        t[0] as f64 / frames,
+        t[1] as f64 / frames / (1 << 20) as f64
     );
 }
 
@@ -4983,6 +5005,7 @@ fn late_line(frames: f64) {
     card_steps::log(frames);
     read_backs_line(frames);
     batch_scratch_line(frames);
+    idle_indirect_line(frames);
     allocator_trim_line();
     dynamic_wait_line(frames);
     crate::draw::waits_line(frames);
@@ -8824,7 +8847,9 @@ impl HostList {
             let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
             if slot.as_ref().is_some_and(|&(_, cap)| cap > IDLE_INDIRECT_MOST) { slot.take() } else { None }
         };
-        if let Some((buffer, _)) = large {
+        if let Some((buffer, cap)) = large {
+            IDLE_INDIRECT_TRIMS[0].fetch_add(1, Ordering::Relaxed);
+            IDLE_INDIRECT_TRIMS[1].fetch_add(cap, Ordering::Relaxed);
             retire_resource(buffer);
         }
     }

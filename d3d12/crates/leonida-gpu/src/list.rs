@@ -2845,13 +2845,31 @@ mod tests {
         };
         // SAFETY: a live buffer.
         let width = |buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource| unsafe { buffer.GetDesc() }.Width;
-        // Through the pool and back. Other tests may give lists to it and
-        // take them too: ours is among the last given, unless one took it.
+        // Through the pool and back. Other tests give lists to it and take
+        // them too: ours is among the last given, unless one took it. The
+        // lists taken out above ours go back in their order, so a test that
+        // expects its own list back still finds it. Only the pool's
+        // functions are used: its layout is not the same on every branch.
+        let detached = |host| Detached { host, _uploads: Vec::new(), _state: Default::default() };
         let round_trip = |list: crate::host::HostList| {
             let raw = list.list.as_raw();
             list.close();
-            recycle(vec![Detached { host: list, _uploads: Vec::new(), _state: Default::default() }], &[0]);
-            (0..16).map_while(|_| fresh_list()).find(|l| l.list.as_raw() == raw)
+            recycle(vec![detached(list)], &[0]);
+            let mut others = Vec::new();
+            let mut ours = None;
+            for _ in 0..16 {
+                let Some(l) = fresh_list() else { break };
+                if l.list.as_raw() == raw {
+                    ours = Some(l);
+                    break;
+                }
+                l.close();
+                others.push(detached(l));
+            }
+            others.reverse();
+            let all: Vec<usize> = (0..others.len()).collect();
+            recycle(others, &all);
+            ours
         };
         let list = host.new_list().unwrap();
         assert_eq!(width(&list.indirect_scratch(1).unwrap()), 64 << 10);
