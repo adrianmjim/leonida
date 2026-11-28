@@ -9,6 +9,22 @@
 //!    an entry whose description differs, so neither is ever used. NVIDIA
 //!    pipelines with static samplers are named by the places of their
 //!    samplers too ([`super::places`]), or left to the driver's own cache.
+//!
+//!    The library is kept for one set of translated shaders: the
+//!    fingerprint of what made them (the translator, its settings, what it
+//!    was told of the host, and the driver: [`super::known::fingerprint`],
+//!    the one `leonida warm` keeps its list by) is written beside it as
+//!    `host-pipelines.fingerprint`. A start whose fingerprint is not the
+//!    one written there (or finds none) starts an empty library, and its
+//!    first save writes that over the old one. Entries of an earlier
+//!    translation are never loaded again (their names hash the old code),
+//!    yet they were kept: every save wrote the whole library back, so the
+//!    file (and what the host reads of it) only grew with each translator
+//!    change. A save
+//!    deletes the fingerprint before it renames a library of other shaders
+//!    over the file and writes the new one after, so a save cut short
+//!    leaves no fingerprint (an empty library next start), never a stale
+//!    library under the current fingerprint.
 //! 2. The title pipelines a run drew or dispatched with are listed by a key
 //!    known when the title creates them (their shader containers and
 //!    graphics state); the next run hands those to the workers at
@@ -209,12 +225,31 @@ enum Blob {
 
 impl Blob {
     /// The library file in `dir`: a library a save left beside it
-    /// ([`NEXT_FILE`]) takes its place first.
+    /// ([`NEXT_FILE`]) takes its place first. None when it was saved for
+    /// other shaders than this run's ([`reuse_blob`]).
     fn of(dir: &std::path::Path) -> Blob {
         let path = dir.join(LIBRARY_FILE);
         let next = dir.join(NEXT_FILE);
         if next.exists() && std::fs::rename(&next, &path).is_err() {
             tracing::warn!("the host pipeline library saved last could not take the old one's place");
+        }
+        // The fingerprint is that of the library the next start opens: of
+        // the waiting one while it is still there, so the older file under
+        // the name is not taken for it.
+        let stored = if next.exists() {
+            None
+        } else {
+            std::fs::read_to_string(dir.join(FINGERPRINT_FILE)).ok()
+        };
+        if !reuse_blob(stored.as_deref(), shaders()) {
+            if path.exists() {
+                tracing::info!(
+                    stored = stored.as_deref().unwrap_or("none").trim(),
+                    current = shaders(),
+                    "host pipeline library saved for other shaders; starting an empty one"
+                );
+            }
+            return Blob::None;
         }
         if mapped()
             && let Some(file) = Mapped::open(&path)
@@ -440,6 +475,27 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// had it mapped (a system that refuses to replace a mapped file): the next
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
+/// The fingerprint of the shaders the library on disk was made for
+/// ([`shaders`]), of the library the next start opens.
+const FINGERPRINT_FILE: &str = "host-pipelines.fingerprint";
+
+/// What this run's host pipelines are made from, as [`FINGERPRINT_FILE`]
+/// holds it: the translator, its settings and what it was told of the
+/// host, and the driver ([`super::known::fingerprint`]). Not our
+/// executable: a rebuild that translates the same way keeps the library.
+fn shaders() -> &'static str {
+    static NOW: OnceLock<String> = OnceLock::new();
+    NOW.get_or_init(super::known::fingerprint)
+}
+
+/// Whether a library saved with the fingerprint `stored` is opened by a run
+/// whose shaders have the fingerprint `current`: only when they are the
+/// same. With none (a library saved before fingerprints were written, or a
+/// save cut short between its rename and the fingerprint) it is not: the
+/// stale pipelines of an earlier translation would stay in it for good.
+fn reuse_blob(stored: Option<&str>, current: &str) -> bool {
+    !current.is_empty() && stored.is_some_and(|stored| stored.trim() == current)
+}
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 100_000;
@@ -737,9 +793,40 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
 /// the mapping goes on reading the old one for as long as a handle on it
 /// is open ([`holds`]; with none, only the pages in memory at that moment
 /// stay: the rest read as zeros). Where a system refuses, the new library
-/// is left beside it as [`NEXT_FILE`] for the next start.
+/// is left beside it as [`NEXT_FILE`] for the next start. The new library
+/// was made for this run's shaders ([`replace_library_for`]).
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+    replace_library_for(dir, tmp, shaders())
+}
+
+/// As [`replace_library`], for a library made for the shaders with the
+/// fingerprint `current` ([`shaders`]). When [`FINGERPRINT_FILE`] holds another (this run started
+/// empty), it is deleted before the rename and written after: a save cut
+/// short in between leaves a library with no fingerprint, which the next
+/// start does not open. Written first, a crash before the rename would
+/// leave the old library under this fingerprint, and every later save
+/// would keep its stale pipelines.
+fn replace_library_for(dir: &std::path::Path, tmp: &std::path::Path, current: &str) -> std::io::Result<()> {
+    let noted = dir.join(FINGERPRINT_FILE);
+    let same = reuse_blob(std::fs::read_to_string(&noted).ok().as_deref(), current);
+    if !same {
+        match std::fs::remove_file(&noted) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    if std::fs::rename(tmp, dir.join(LIBRARY_FILE)).is_ok() {
+        // A library an earlier save left waiting is older than this one,
+        // yet the next start would rename it over this one, and open it
+        // under this fingerprint.
+        match std::fs::remove_file(dir.join(NEXT_FILE)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound && !same => return Err(e),
+            _ => {}
+        }
+    } else {
+        std::fs::rename(tmp, dir.join(NEXT_FILE))?;
+    }
+    if same { Ok(()) } else { write_atomically(&noted, current.as_bytes()) }
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -892,6 +979,8 @@ mod tests {
     fn the_library_file_is_mapped_and_replaced() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LIBRARY_FILE);
+        // A library of this run's shaders.
+        std::fs::write(dir.path().join(FINGERPRINT_FILE), shaders()).unwrap();
         assert!(matches!(Blob::of(dir.path()), Blob::None), "no file yet");
         std::fs::write(&path, b"").unwrap();
         assert!(matches!(Blob::of(dir.path()), Blob::None), "an empty file");
@@ -916,6 +1005,62 @@ mod tests {
         // The next start reads the new one, wherever the save left it.
         assert_eq!(Blob::of(dir.path()).bytes(), &new[..]);
         assert!(!dir.path().join(NEXT_FILE).exists());
+    }
+
+    #[test]
+    fn a_library_is_reused_only_for_the_same_shaders() {
+        assert!(reuse_blob(Some("0123456789abcdef"), "0123456789abcdef"));
+        // As a file holds it, with a line end added by hand.
+        assert!(reuse_blob(Some("0123456789abcdef\r\n"), "0123456789abcdef"));
+        assert!(!reuse_blob(Some("fedcba9876543210"), "0123456789abcdef"), "a translator change");
+        assert!(!reuse_blob(None, "0123456789abcdef"), "saved before fingerprints, or a save cut short");
+        assert!(!reuse_blob(Some(""), "0123456789abcdef"));
+        assert!(!reuse_blob(Some(""), ""));
+    }
+
+    /// The library of an earlier translation is not opened (main opened
+    /// whatever the file held, and saved it back whole with the new
+    /// pipelines); one saved for this run's shaders is.
+    #[test]
+    fn a_library_saved_for_other_shaders_is_not_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = b"pipelines of an earlier translation".repeat(64);
+        std::fs::write(dir.path().join(LIBRARY_FILE), &old).unwrap();
+        let noted = dir.path().join(FINGERPRINT_FILE);
+        assert!(matches!(Blob::of(dir.path()), Blob::None), "no fingerprint written");
+        std::fs::write(&noted, "not these shaders").unwrap();
+        assert!(matches!(Blob::of(dir.path()), Blob::None), "the fingerprint of other shaders");
+        std::fs::write(&noted, shaders()).unwrap();
+        assert_eq!(Blob::of(dir.path()).bytes(), &old[..], "the fingerprint of these shaders");
+    }
+
+    /// A save writes the fingerprint of its shaders with the library, drops
+    /// a library left waiting by an earlier save, and leaves no fingerprint
+    /// that names other shaders than the library's.
+    #[test]
+    fn a_save_writes_its_fingerprint_with_the_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let (library, next, noted) =
+            (dir.path().join(LIBRARY_FILE), dir.path().join(NEXT_FILE), dir.path().join(FINGERPRINT_FILE));
+        let tmp = library.with_extension("tmp");
+        std::fs::write(&library, b"old").unwrap();
+        std::fs::write(&next, b"older, waiting").unwrap();
+        std::fs::write(&noted, "old shaders").unwrap();
+        std::fs::write(&tmp, b"new").unwrap();
+        replace_library_for(dir.path(), &tmp, "new shaders").unwrap();
+        assert_eq!(std::fs::read(&library).unwrap(), b"new");
+        assert!(!next.exists(), "the waiting library would have taken the new one's place");
+        assert_eq!(std::fs::read_to_string(&noted).unwrap(), "new shaders");
+        // A later save of the same shaders keeps the fingerprint.
+        std::fs::write(&tmp, b"newer").unwrap();
+        replace_library_for(dir.path(), &tmp, "new shaders").unwrap();
+        assert_eq!(std::fs::read(&library).unwrap(), b"newer");
+        assert_eq!(std::fs::read_to_string(&noted).unwrap(), "new shaders");
+        // A save for other shaders cut short before its library is in place
+        // (here: no new library to rename) leaves no fingerprint: the
+        // library on disk is opened by neither the old shaders nor these.
+        replace_library_for(dir.path(), &tmp, "other shaders").unwrap_err();
+        assert!(!noted.exists());
     }
 
     /// The bytes at `at` of the pattern the test below writes.
