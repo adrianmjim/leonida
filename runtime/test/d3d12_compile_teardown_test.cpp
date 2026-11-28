@@ -19,6 +19,10 @@
 //                 is skipped and a dispatch (LEONIDA_ASYNC_PIPELINES on) builds its pipeline in place and runs;
 //                 save_pipeline_caches_at_exit then writes the session cache with the device alive, once.
 // After each case the compiler's thread is gone and the process's thread count is back where it was.
+// --seed instead runs the session file beside an offline seed (seeded_session): a session file written beside the
+// seed there now, as pipeline_cache.session.seed records, is loaded alone, the seed not read and nothing merged, and
+// its pipelines are cache hits; a touched seed, no seed, no record, LEONIDA_PIPELINE_CACHE_BYTES=0 and
+// LEONIDA_SESSION_CACHE_DIRECT_SEED=0 behave as before.
 // No game data: the shader is test/glsl/cs_user_data.comp, the programs are made-up FSSM bytes.
 #include "shader_fixture_path.h"
 #include "test_temp_dir.h"
@@ -27,6 +31,7 @@
 #include "../shims/d3d12_compile_exit.h"
 #include "../shims/d3d12_pipeline_compile.h"
 #include "../shims/d3d12_xs_device.h"
+#include "../src/pipeline_cache_store.h"
 #include "../src/shader_library.h"
 
 #include <tlhelp32.h>
@@ -39,6 +44,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -183,16 +191,108 @@ bool built(ID3D12PipelineState* pso) {
     return requests && !requests->empty();  // recorded when the Vulkan pipeline is made (build_compute)
 }
 
+// --seed: what the device does with its pipeline caches, seen through its vkGetDeviceProcAddr: the merges (the
+// session file is the only cache the runtime merges), the size of every blob a cache is created from, and how many
+// compute pipelines the driver found in the cache they were created against (pipeline creation feedback, core in
+// Vulkan 1.3).
+struct CacheCalls {
+    std::atomic<unsigned> merges{0}, builds{0}, hits{0};
+    std::mutex mutex;
+    std::vector<std::size_t> loads;  // initialDataSize of each vkCreatePipelineCache with data, in order
+    void reset() {
+        merges = builds = hits = 0;
+        std::lock_guard lock(mutex);
+        loads.clear();
+    }
+};
+CacheCalls cache_calls;
+PFN_vkGetInstanceProcAddr real_instance_proc = nullptr;
+PFN_vkGetDeviceProcAddr real_device_proc = nullptr;
+PFN_vkMergePipelineCaches real_merge = nullptr;
+PFN_vkCreatePipelineCache real_create_cache = nullptr;
+PFN_vkCreateComputePipelines real_create_compute = nullptr;
+
+VKAPI_ATTR VkResult VKAPI_CALL counted_merge(VkDevice device, VkPipelineCache into, std::uint32_t count,
+                                             const VkPipelineCache* from) {
+    ++cache_calls.merges;
+    return real_merge(device, into, count, from);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL counted_create_cache(VkDevice device, const VkPipelineCacheCreateInfo* info,
+                                                    const VkAllocationCallbacks* allocator, VkPipelineCache* cache) {
+    if (info && info->initialDataSize) {
+        std::lock_guard lock(cache_calls.mutex);
+        cache_calls.loads.push_back(info->initialDataSize);
+    }
+    return real_create_cache(device, info, allocator, cache);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL counted_create_compute(VkDevice device, VkPipelineCache cache, std::uint32_t count,
+                                                      const VkComputePipelineCreateInfo* infos,
+                                                      const VkAllocationCallbacks* allocator, VkPipeline* pipelines) {
+    // The runtime's own feedback when it chains one (a second in the chain would be invalid), ours otherwise.
+    std::vector<VkComputePipelineCreateInfo> copies(infos, infos + count);
+    std::vector<VkPipelineCreationFeedback> ours(count);
+    std::vector<VkPipelineCreationFeedbackCreateInfo> chained(count);
+    std::vector<const VkPipelineCreationFeedback*> read(count);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        for (auto* p = static_cast<const VkBaseInStructure*>(copies[i].pNext); p; p = p->pNext)
+            if (p->sType == VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO)
+                read[i] = reinterpret_cast<const VkPipelineCreationFeedbackCreateInfo*>(p)->pPipelineCreationFeedback;
+        if (read[i]) continue;
+        chained[i] = {VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, copies[i].pNext, &ours[i], 0, nullptr};
+        copies[i].pNext = &chained[i];
+        read[i] = &ours[i];
+    }
+    const VkResult result = real_create_compute(device, cache, count, copies.data(), allocator, pipelines);
+    if (result == VK_SUCCESS)
+        for (std::uint32_t i = 0; i < count; ++i) {
+            ++cache_calls.builds;
+            constexpr auto hit = VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT |
+                                 VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT;
+            if ((read[i]->flags & hit) == hit) ++cache_calls.hits;
+        }
+    return result;
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL counted_device_proc(VkDevice device, const char* name) {
+    const PFN_vkVoidFunction real = real_device_proc(device, name);
+    if (!real) return real;
+    if (!std::strcmp(name, "vkMergePipelineCaches")) {
+        real_merge = reinterpret_cast<PFN_vkMergePipelineCaches>(real);
+        return reinterpret_cast<PFN_vkVoidFunction>(counted_merge);
+    }
+    if (!std::strcmp(name, "vkCreatePipelineCache")) {
+        real_create_cache = reinterpret_cast<PFN_vkCreatePipelineCache>(real);
+        return reinterpret_cast<PFN_vkVoidFunction>(counted_create_cache);
+    }
+    if (!std::strcmp(name, "vkCreateComputePipelines")) {
+        real_create_compute = reinterpret_cast<PFN_vkCreateComputePipelines>(real);
+        return reinterpret_cast<PFN_vkVoidFunction>(counted_create_compute);
+    }
+    return real;
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL counted_instance_proc(VkInstance instance, const char* name) {
+    if (!std::strcmp(name, "vkGetDeviceProcAddr")) {
+        real_device_proc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(real_instance_proc(instance, name));
+        return reinterpret_cast<PFN_vkVoidFunction>(counted_device_proc);
+    }
+    return real_instance_proc(instance, name);
+}
+
 // One D3D12 device over the test's VkDevice, the compute test's root signature (two constants, a root UAV, a CBV
 // table) and PSOs. The title's references, released in any order with release().
 struct Session {
     ID3D12Device* device = nullptr;
     ID3D12RootSignature* root = nullptr;
     std::vector<ID3D12PipelineState*> psos;
+    bool count_cache_calls = false;  // the device gets its functions through counted_instance_proc
 
     int open(vktest::Device& d, const std::filesystem::path& library, unsigned count) {
         rt::d3d12::VulkanDeviceInfo info{};
-        info.get_instance_proc = d.instance_proc;
+        real_instance_proc = d.instance_proc;
+        info.get_instance_proc = count_cache_calls ? counted_instance_proc : d.instance_proc;
         info.instance = d.instance;
         info.physical = d.physical;
         info.device = d.device;
@@ -385,9 +485,184 @@ struct Park {
     }
 };
 
+std::vector<char> read_bytes(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+}
+
+bool write_bytes(const std::filesystem::path& path, const std::vector<char>& bytes) {
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    file.write(bytes.data(), std::streamsize(bytes.size()));
+    return bool(file);
+}
+
+// A file's size and last-write time, as the runtime records a seed's (pipeline_cache_store::SeedStamp); zero when
+// there is no such file.
+leonida::pipeline_cache_store::SeedStamp stamp_of(const std::filesystem::path& path) {
+    WIN32_FILE_ATTRIBUTE_DATA about{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &about)) return {};
+    return {(std::uint64_t(about.nFileSizeHigh) << 32) | about.nFileSizeLow,
+            (std::uint64_t(about.ftLastWriteTime.dwHighDateTime) << 32) | about.ftLastWriteTime.dwLowDateTime};
+}
+
+// --seed: pipeline_cache.session.bin beside an offline pipeline_cache.bin, and the record of which seed it was
+// written beside (pipeline_cache.session.seed). The journal is off, so a round's compute build goes into the shared
+// cache and the session file is its only copy. The seed is an empty cache of this device. Each round opens a device,
+// builds one PSO (always the same pipeline), tears the device down, which writes the session file, and reports the
+// device's merges, the blobs it created caches from and whether the build was a cache hit.
+int seeded_session(vktest::Device& d, const std::filesystem::path& library, const std::filesystem::path& cache_dir) {
+    namespace store = leonida::pipeline_cache_store;
+    const auto seed_file = cache_dir / "pipeline_cache.bin";
+    const auto session_file = cache_dir / "pipeline_cache.session.bin";
+    const auto record_file = cache_dir / "pipeline_cache.session.seed";
+    std::vector<char> seed;
+    {
+        const auto create = reinterpret_cast<PFN_vkCreatePipelineCache>(d.device_proc(d.device, "vkCreatePipelineCache"));
+        const auto destroy = reinterpret_cast<PFN_vkDestroyPipelineCache>(d.device_proc(d.device, "vkDestroyPipelineCache"));
+        const auto data = reinterpret_cast<PFN_vkGetPipelineCacheData>(d.device_proc(d.device, "vkGetPipelineCacheData"));
+        EXPECT(create && destroy && data);
+        const VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        VkPipelineCache cache = VK_NULL_HANDLE;
+        EXPECT(create(d.device, &info, nullptr, &cache) == VK_SUCCESS);
+        std::size_t size = 0;
+        const bool sized = data(d.device, cache, &size, nullptr) == VK_SUCCESS;
+        seed.resize(size);
+        const bool read = sized && data(d.device, cache, &size, seed.data()) == VK_SUCCESS;
+        destroy(d.device, cache, nullptr);
+        EXPECT(read && size >= store::header_bytes);
+        seed.resize(size);
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(cache_dir, ec);
+    for (const auto& file : {seed_file, session_file, record_file}) std::filesystem::remove(file, ec);
+    EXPECT(write_bytes(seed_file, seed));
+    const std::size_t seed_bytes = seed.size();
+    using Sizes = std::vector<std::size_t>;
+
+    struct Result {
+        unsigned merges = 0, builds = 0, hits = 0;
+        Sizes loads;                               // initialDataSize of each cache the device created from a blob
+        std::vector<char> session;                 // the session file after teardown; empty when there is none
+        bool recorded = false;                     // a pipeline_cache.session.seed after teardown
+        std::optional<store::SessionSeed> record;  // and what it says
+    };
+    const auto round = [&](const char* name, Result& result) -> int {
+        cache_calls.reset();
+        Session s;
+        s.count_cache_calls = true;
+        if (s.open(d, library, 1)) return 1;
+        EXPECT(drain(PipelineCompiler::instance()));
+        EXPECT(built(s.psos[0]));
+        s.release();
+        result.merges = cache_calls.merges.load();
+        result.builds = cache_calls.builds.load();
+        result.hits = cache_calls.hits.load();
+        {
+            std::lock_guard lock(cache_calls.mutex);
+            result.loads = cache_calls.loads;
+        }
+        result.session = std::filesystem::exists(session_file) ? read_bytes(session_file) : std::vector<char>{};
+        result.recorded = std::filesystem::exists(record_file);
+        if (result.recorded) {
+            const auto text = read_bytes(record_file);
+            result.record = store::parse_session_seed(std::string_view(text.data(), text.size()));
+        }
+        std::string loads;
+        for (const std::size_t bytes : result.loads) loads += (loads.empty() ? "" : ", ") + std::to_string(bytes);
+        std::printf("seed: %s: %u merge(s), caches created from [%s] bytes, %u of %u compute build(s) a cache hit; "
+                    "then a %zu-byte session file, %s\n", name, result.merges, loads.c_str(), result.hits,
+                    result.builds, result.session.size(),
+                    !result.recorded ? "no record" : result.record ? "a record" : "an UNREADABLE record");
+        return 0;
+    };
+    const auto records = [&](const Result& result) {
+        return result.record && result.record->seed == stamp_of(seed_file) &&
+               result.record->session_bytes == result.session.size();
+    };
+    std::printf("seed: the seed is an empty cache of %zu bytes\n", seed_bytes);
+
+    // 1. The seed alone: loaded, the pipeline built (no hit), the session file written with a record of the seed.
+    Result first;
+    if (round("seed, no session file", first)) return 1;
+    EXPECT(first.merges == 0);
+    EXPECT(first.loads == Sizes{seed_bytes});
+    EXPECT(first.builds >= 1 && first.hits == 0);
+    EXPECT(first.session.size() > seed_bytes);
+
+    // 2. Relaunch: the session file, which holds the seed, is the cache. The seed is not read, nothing is merged, and
+    // the pipeline from round 1 is a cache hit.
+    Result direct;
+    if (round("relaunch", direct)) return 1;
+    EXPECT(direct.merges == 0);  // before pipeline_cache.session.seed: the session file merged into the seed, 1
+    EXPECT(records(first));
+    EXPECT(direct.loads == Sizes{first.session.size()});
+    EXPECT(direct.hits >= 1);
+    EXPECT(records(direct));
+
+    // 3. The seed touched (a new corpus build): the seed is loaded and the session file merged, as before; the record
+    // then names the new seed, and the next launch loads the session file alone again.
+    std::filesystem::last_write_time(seed_file, std::filesystem::last_write_time(seed_file) + std::chrono::hours(1), ec);
+    EXPECT(!ec && stamp_of(seed_file) != direct.record->seed);
+    Result touched;
+    if (round("the seed touched", touched)) return 1;
+    EXPECT(touched.merges == 1);
+    EXPECT(touched.loads == (Sizes{seed_bytes, direct.session.size()}));
+    EXPECT(touched.hits >= 1);
+    EXPECT(records(touched));
+    Result again;
+    if (round("relaunch after the touch", again)) return 1;
+    EXPECT(again.merges == 0 && again.loads == Sizes{touched.session.size()} && again.hits >= 1);
+
+    // 4. No seed: the session file initializes the cache directly, as before, and the session file written without a
+    // seed removes the record.
+    std::filesystem::remove(seed_file, ec);
+    Result unseeded;
+    if (round("no seed", unseeded)) return 1;
+    EXPECT(unseeded.merges == 0 && unseeded.loads == Sizes{again.session.size()} && unseeded.hits >= 1);
+    EXPECT(!unseeded.session.empty() && !unseeded.recorded);
+
+    // 5. LEONIDA_PIPELINE_CACHE_BYTES=0 with the seed back: the seed alone, the session file neither read nor
+    // written, and no record.
+    EXPECT(write_bytes(seed_file, seed));
+    _putenv_s("LEONIDA_PIPELINE_CACHE_BYTES", "0");
+    Result off;
+    int failed = round("LEONIDA_PIPELINE_CACHE_BYTES=0", off);
+    _putenv_s("LEONIDA_PIPELINE_CACHE_BYTES", "67108864");
+    if (failed) return 1;
+    EXPECT(off.merges == 0 && off.loads == Sizes{seed_bytes});
+    EXPECT(off.session == unseeded.session && !off.recorded);
+
+    // 6. A seed and a session file with no record: the seed loaded and the session file merged, as before, and the
+    // record written. Then LEONIDA_SESSION_CACHE_DIRECT_SEED=0: the same, although the record matches.
+    Result unrecorded;
+    if (round("seed and session file, no record", unrecorded)) return 1;
+    EXPECT(unrecorded.merges == 1 && unrecorded.loads == (Sizes{seed_bytes, off.session.size()}));
+    EXPECT(unrecorded.hits >= 1 && records(unrecorded));
+    _putenv_s("LEONIDA_SESSION_CACHE_DIRECT_SEED", "0");
+    Result switched;
+    failed = round("LEONIDA_SESSION_CACHE_DIRECT_SEED=0", switched);
+    _putenv_s("LEONIDA_SESSION_CACHE_DIRECT_SEED", "");
+    if (failed) return 1;
+    EXPECT(switched.merges == 1 && switched.loads == (Sizes{seed_bytes, unrecorded.session.size()}));
+    EXPECT(switched.hits >= 1 && records(switched));
+    std::printf("ok\n");
+    return 0;
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool seed_mode = argc > 1 && !std::strcmp(argv[1], "--seed");
+    // --seed: no journal (a build goes into the shared cache), a session file read directly when there is no seed, no
+    // compile helper, no startup checkpoints and the new launch path on (the defaults but the journal, set so a
+    // caller's environment cannot change which caches the rounds go through).
+    if (seed_mode) {
+        _putenv_s("LEONIDA_PIPELINE_JOURNAL", "0");
+        _putenv_s("LEONIDA_DIRECT_SESSION_CACHE", "1");
+        _putenv_s("LEONIDA_COMPILE_HELPER", "0");
+        _putenv_s("LEONIDA_STARTUP_CACHE_CHECKPOINTS", "0");
+        _putenv_s("LEONIDA_SESSION_CACHE_DIRECT_SEED", "");
+    }
     // Lazy compute with the warm-up thread on (the defaults, set so a caller's environment cannot turn them off), and
     // asynchronous first-use builds, so the exit case's dispatch goes through queue_build.
     _putenv_s("LEONIDA_LAZY_COMPUTE", "1");
@@ -432,6 +707,13 @@ int main() {
         d.instance_proc(d.instance, "vkGetPhysicalDeviceProperties2"))(d.physical, &properties);
     const bool caches = driver.driverID != VK_DRIVER_ID_MESA_LLVMPIPE;
     const auto session_file = cache_dir / "pipeline_cache.session.bin";
+    if (seed_mode) {
+        if (!caches) {
+            std::printf("SKIP: the driver keeps no pipelines in its cache\n");
+            return 77;
+        }
+        return seeded_session(d, library, cache_dir);
+    }
 
     // --- cache: one PSO built by the warm-up thread; the device writes the session cache at teardown -------------
     {

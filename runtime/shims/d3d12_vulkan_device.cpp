@@ -1767,6 +1767,13 @@ std::filesystem::path pipeline_cache_session_path() {
     return path;
 }
 
+// Which offline seed the session file was written beside (pipeline_cache_store::SessionSeed).
+std::filesystem::path pipeline_cache_session_seed_path() {
+    std::filesystem::path path = pipeline_cache_path();
+    if (!path.empty()) path.replace_filename(L"pipeline_cache.session.seed");
+    return path;
+}
+
 // The pipelines the offline seed does not have, kept next to it and written while the game runs
 // (src/heavy_pipeline_cache.h).
 std::filesystem::path pipeline_cache_heavy_path() {
@@ -1934,6 +1941,23 @@ std::size_t pipeline_cache_save_limit() {
     return limit.bytes;
 }
 
+// LEONIDA_SESSION_CACHE_DIRECT_SEED=0: always load the offline seed and merge the session file into it, even when
+// pipeline_cache.session.seed says the session file already holds that seed (create_session_cache_over_seed). Read
+// for each device, like LEONIDA_PIPELINE_CACHE_BYTES.
+bool session_cache_direct_seed() {
+    wchar_t value[2]{};
+    return !(GetEnvironmentVariableW(L"LEONIDA_SESSION_CACHE_DIRECT_SEED", value, 2) == 1 && value[0] == L'0');
+}
+
+// The size and last-write time of an open file, from the handle, so they describe the bytes read through it.
+bool file_seed_stamp(HANDLE file, leonida::pipeline_cache_store::SeedStamp& out) {
+    BY_HANDLE_FILE_INFORMATION about{};
+    if (file == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(file, &about)) return false;
+    out.bytes = (std::uint64_t(about.nFileSizeHigh) << 32) | about.nFileSizeLow;
+    out.write_time = (std::uint64_t(about.ftLastWriteTime.dwHighDateTime) << 32) | about.ftLastWriteTime.dwLowDateTime;
+    return true;
+}
+
 // A corpus cache may be several GiB. Keep the read-only view alive through vkCreatePipelineCache
 // and deny writers while the view is in use.
 class PipelineCacheSeed {
@@ -1969,14 +1993,24 @@ public:
         return leonida::pipeline_cache_store::header_matches(data_, size_, identity);
     }
 
+    // The mapped file's size and time; zero when it is not mapped.
+    leonida::pipeline_cache_store::SeedStamp stamp() const {
+        leonida::pipeline_cache_store::SeedStamp out;
+        if (!data_ || !file_seed_stamp(file_, out)) return {};
+        return out;
+    }
+
 private:
     HANDLE file_ = INVALID_HANDLE_VALUE;
     const void* data_ = nullptr;
     std::size_t size_ = 0;
 };
 
+// `stamp`, with the offline seed (not `session`): which pipeline_cache.bin the cache was created from, for the
+// session file's record (save_session_pipeline_cache); left as it was when no cache is created.
 VkPipelineCache create_seeded_pipeline_cache(PFN_vkCreatePipelineCache create_cache, VkDevice device,
-                                             const leonida::cached_pso::Identity& identity, bool session = false) {
+                                             const leonida::cached_pso::Identity& identity, bool session = false,
+                                             leonida::pipeline_cache_store::SeedStamp* stamp = nullptr) {
     auto start = compile_us();
     const auto name = session ? "pipeline_cache.session.bin" : "pipeline_cache.bin";
     const PipelineCacheSeed seed(session ? pipeline_cache_session_path() : pipeline_cache_path());
@@ -1995,9 +2029,78 @@ VkPipelineCache create_seeded_pipeline_cache(PFN_vkCreatePipelineCache create_ca
     }
     std::fprintf(stderr, "[rt] d3d12: loaded %zu bytes from %s\n", seed.size(), name);
     if (!session) g_offline_seed_bytes.store(seed.size(), std::memory_order_relaxed);
+    if (!session && stamp) *stamp = seed.stamp();
     if (trace_pipeline_compile())
         std::fprintf(stderr, "[rt] pipeline-cache op=load bytes=%zu map_us=%lld driver_us=%lld file=%s\n",
                      seed.size(), mapped-start, compile_us()-mapped, name);
+    return cache;
+}
+
+// The record of the seed the session file was written beside; nothing when there is none or it is not one.
+std::optional<leonida::pipeline_cache_store::SessionSeed> read_session_seed(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return std::nullopt;
+    char text[256];
+    in.read(text, sizeof(text));
+    const auto got = std::size_t(in.gcount());
+    if (got == sizeof(text)) return std::nullopt;  // larger than any record
+    return leonida::pipeline_cache_store::parse_session_seed(std::string_view(text, got));
+}
+
+// With an offline seed, the session file is what the driver wrote back of the shared cache: the seed's pipelines and
+// the session's together, about the seed's size again (1.88 GB of seed, 0.1 to 6 MB added on an RX 7900 XT). Loading
+// the seed and then merging the session file built two such driver caches at every launch (private commit 8.1 ->
+// 9.95 -> 8.3 GB in the first 20 s). When pipeline_cache.session.seed says the session file was written beside
+// exactly the pipeline_cache.bin there now, and it has not changed size since, the session file alone is the cache:
+// the seed is not mapped and nothing is merged. Anything else (no record, another seed, a session file the record
+// does not describe, one for another device or one the driver declines) returns no cache and the caller loads the
+// seed and merges as before. `stamp`: the seed's, when a cache is returned.
+VkPipelineCache create_session_cache_over_seed(PFN_vkCreatePipelineCache create_cache, VkDevice device,
+                                               const leonida::cached_pso::Identity& identity,
+                                               leonida::pipeline_cache_store::SeedStamp& stamp) {
+    const auto record_path = pipeline_cache_session_seed_path();
+    if (record_path.empty()) return VK_NULL_HANDLE;
+    std::error_code ec;
+    if (!std::filesystem::exists(record_path, ec)) return VK_NULL_HANDLE;  // written without a seed, or never
+    const auto recorded = read_session_seed(record_path);
+    // The seed's size and time without reading it: a handle for its attributes only.
+    leonida::pipeline_cache_store::SeedStamp seed;
+    const HANDLE seed_file = CreateFileW(pipeline_cache_path().c_str(), FILE_READ_ATTRIBUTES,
+                                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const bool seed_known = file_seed_stamp(seed_file, seed);
+    if (seed_file != INVALID_HANDLE_VALUE) CloseHandle(seed_file);
+    if (!seed_known) return VK_NULL_HANDLE;  // no seed: the session file is loaded directly as before
+    auto start = compile_us();
+    const PipelineCacheSeed session(pipeline_cache_session_path());
+    if (!leonida::pipeline_cache_store::session_holds_seed(recorded, seed, session.size())) {
+        std::fprintf(stderr, "[rt] d3d12: pipeline_cache.session.seed does not describe this pipeline_cache.bin and "
+                             "pipeline_cache.session.bin; loading the seed and merging\n");
+        return VK_NULL_HANDLE;
+    }
+    if (!session.compatible(identity)) {
+        std::fprintf(stderr, "[rt] d3d12: pipeline_cache.session.bin does not match this Vulkan device\n");
+        return VK_NULL_HANDLE;
+    }
+    const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0, session.size(),
+                                           session.data()};
+    VkPipelineCache cache = VK_NULL_HANDLE;
+    const auto mapped = compile_us();
+    if (create_cache(device, &create, nullptr, &cache) != VK_SUCCESS) {
+        std::fprintf(stderr, "[rt] d3d12: Vulkan declined pipeline_cache.session.bin; loading the seed and merging\n");
+        return VK_NULL_HANDLE;
+    }
+    std::fprintf(stderr, "[rt] d3d12: loaded %zu bytes from pipeline_cache.session.bin, which holds the %llu-byte "
+                         "pipeline_cache.bin it was written beside; the seed was not loaded and nothing merged "
+                         "(LEONIDA_SESSION_CACHE_DIRECT_SEED=0: load both)\n",
+                 session.size(), static_cast<unsigned long long>(seed.bytes));
+    // Still the seed's size: the save limit counts what a session adds to the seed, not to this file.
+    g_offline_seed_bytes.store(std::size_t(seed.bytes), std::memory_order_relaxed);
+    stamp = seed;
+    if (trace_pipeline_compile())
+        std::fprintf(stderr, "[rt] pipeline-cache op=load bytes=%zu map_us=%lld driver_us=%lld "
+                             "file=pipeline_cache.session.bin seed_bytes=%llu\n",
+                     session.size(), mapped-start, compile_us()-mapped, static_cast<unsigned long long>(seed.bytes));
     return cache;
 }
 
@@ -2132,9 +2235,32 @@ bool startup_cache_checkpoints_enabled() {
     return enabled;
 }
 
+// pipeline_cache.session.seed after the session file was published: which offline seed it was written beside. With
+// none (`seed` zero) the session file holds no seed's pipelines for sure, and a record an earlier run left goes, so it
+// is never taken to describe this file. A failed publish leaves the session file and its record as they were.
+void record_session_seed(const leonida::pipeline_cache_store::SeedStamp& seed, std::size_t session_bytes) {
+    const auto path = pipeline_cache_session_seed_path();
+    if (path.empty()) return;
+    if (!seed.bytes) {
+        std::error_code ec;
+        if (std::filesystem::remove(path, ec))
+            std::fprintf(stderr, "[rt] d3d12: pipeline_cache.session.bin was written without an offline seed; "
+                                 "pipeline_cache.session.seed removed\n");
+        return;
+    }
+    const std::string text = leonida::pipeline_cache_store::format_session_seed({seed, session_bytes});
+    CacheStagingFile staging(path, text.size());
+    if (staging.data) std::memcpy(staging.data, text.data(), text.size());
+    if (!staging.data || !staging.publish(path, text.size()))
+        std::fprintf(stderr, "[rt] d3d12: could not write pipeline_cache.session.seed; the next launch loads the seed "
+                             "and merges pipeline_cache.session.bin into it\n");
+}
+
 // Writes the session cache at a startup checkpoint or during device teardown. The size cap applies to either write.
+// `seed`: the offline seed this device's shared cache was created from (DeviceState::offline_seed), zero for none.
 void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDevice device, VkPipelineCache cache,
-                                 bool checkpoint = false, const char* op = nullptr) {
+                                 const leonida::pipeline_cache_store::SeedStamp& seed, bool checkpoint = false,
+                                 const char* op = nullptr) {
     if (!cache || !vk.vkGetPipelineCacheData) return;
     // The output is an opaque Vulkan blob. A prefix is not an incremental cache, so past the limit nothing is written.
     const auto limit = pipeline_cache_save_limit();
@@ -2143,10 +2269,10 @@ void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDev
     std::size_t size = 0;
     if (vk.vkGetPipelineCacheData(device, cache, &size, nullptr) != VK_SUCCESS ||
         size <= sizeof(VkPipelineCacheHeaderVersionOne)) return;
-    const std::size_t seed = g_offline_seed_bytes.load(std::memory_order_relaxed);
-    if (leonida::pipeline_cache_store::over_save_limit(size, seed, limit)) {
+    const std::size_t seed_bytes = g_offline_seed_bytes.load(std::memory_order_relaxed);
+    if (leonida::pipeline_cache_store::over_save_limit(size, seed_bytes, limit)) {
         std::fprintf(stderr, "[rt] d3d12: pipeline cache is %zu bytes (%zu of them the offline seed), over the "
-                             "%zu-byte write limit for what a session adds\n", size, seed, limit);
+                             "%zu-byte write limit for what a session adds\n", size, seed_bytes, limit);
         return;
     }
     const auto queried = compile_us();
@@ -2168,8 +2294,12 @@ void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDev
         std::fprintf(stderr, "[rt] pipeline-cache op=%s bytes=%zu query_us=%lld fill_us=%lld publish_us=%lld ok=%d result=%d\n",
                      op ? op : checkpoint ? "checkpoint" : "teardown", written, queried-start, filled-queried,
                      compile_us()-filled, int(ok), int(result));
-    if (ok) std::fprintf(stderr, "[rt] d3d12: wrote %zu bytes to pipeline_cache.session.bin\n", written);
-    else std::fprintf(stderr, "[rt] d3d12: pipeline cache snapshot incomplete (%d); previous session retained\n", int(result));
+    if (ok) {
+        std::fprintf(stderr, "[rt] d3d12: wrote %zu bytes to pipeline_cache.session.bin\n", written);
+        record_session_seed(seed, written);
+    } else {
+        std::fprintf(stderr, "[rt] d3d12: pipeline cache snapshot incomplete (%d); previous session retained\n", int(result));
+    }
 }
 
 // The heavy cache, seeded from pipeline_cache.heavy.bin when it is there and made for this device; empty otherwise.
@@ -2881,6 +3011,10 @@ struct DeviceState {
     // The shared cache started from a file (the offline seed or an earlier session): a compute pipeline the journal
     // has no file for may still be in it (build_compute asks it first, when it can ask without a compile).
     bool pipeline_cache_seeded = false;
+    // The offline seed the shared cache holds, loaded or through a session file written beside it: which
+    // pipeline_cache.bin, for the session file's record (pipeline_cache.session.seed). Zero without one. This device's
+    // own, unlike g_offline_seed_bytes, which an earlier device may have set.
+    leonida::pipeline_cache_store::SeedStamp offline_seed;
     std::atomic<unsigned> journal_hits{0}, journal_writes{0}, journal_shared_hits{0};
     std::atomic<std::uint64_t> journal_bytes{0};  // on disk: counted at the cache's creation, then added to
     std::uint64_t journal_budget = leonida::pipeline_journal::default_budget;
@@ -2897,13 +3031,25 @@ struct DeviceState {
         std::call_once(pipeline_cache_once, [this] {
             const auto& vk = context->vk;
             if (!vk.vkCreatePipelineCache || !vk.vkDestroyPipelineCache) return;
-            if (pipeline_cache_save_limit()) clean_stale_cache_files(pipeline_cache_session_path());
+            if (pipeline_cache_save_limit()) {
+                clean_stale_cache_files(pipeline_cache_session_path());
+                clean_stale_cache_files(pipeline_cache_session_seed_path());
+            }
             // A build host (precompile, compile helper) journals every pipeline: no seed, no session file.
-            if (!compile_helper::build_host)
-                pipeline_cache_handle = create_seeded_pipeline_cache(vk.vkCreatePipelineCache, info.device, pso_identity);
+            bool holds_session = false;  // created from a session file that holds the seed: nothing to merge
+            if (!compile_helper::build_host) {
+                if (pipeline_cache_save_limit() && session_cache_direct_seed()) {
+                    pipeline_cache_handle = create_session_cache_over_seed(vk.vkCreatePipelineCache, info.device,
+                                                                           pso_identity, offline_seed);
+                    holds_session = pipeline_cache_handle != VK_NULL_HANDLE;
+                }
+                if (!pipeline_cache_handle)
+                    pipeline_cache_handle = create_seeded_pipeline_cache(vk.vkCreatePipelineCache, info.device,
+                                                                         pso_identity, false, &offline_seed);
+            }
             if (pipeline_cache_handle) {
                 pipeline_cache_seeded = true;
-                merge_session_pipeline_cache(vk, info.device, pipeline_cache_handle, pso_identity);
+                if (!holds_session) merge_session_pipeline_cache(vk, info.device, pipeline_cache_handle, pso_identity);
             } else if (pipeline_cache_save_limit() && direct_session_cache() && !compile_helper::build_host) {
                 // With no offline seed the session file can initialize the actual cache directly.
                 pipeline_cache_handle = create_seeded_pipeline_cache(vk.vkCreatePipelineCache, info.device, pso_identity, true);
@@ -13348,7 +13494,8 @@ private:
             queued = PipelineCompiler::instance().submit(state, state, SIZE_MAX, [state, cache] {
                 try {
                     if (!state->active_compiles.load() && !PipelineCompiler::instance().has_compile_waiter())
-                        save_session_pipeline_cache(state->context->vk, state->info.device, cache, true);
+                        save_session_pipeline_cache(state->context->vk, state->info.device, cache, state->offline_seed,
+                                                    true);
                 } catch (const std::exception& e) {
                     std::fprintf(stderr, "[rt] pipeline cache checkpoint failed: %s\n", e.what());
                 }
@@ -16182,7 +16329,8 @@ public:
                 std::fprintf(stderr, "[rt] d3d12: %u pipeline build(s) still running at device teardown; "
                                      "pipeline_cache.session.bin not written\n", building);
             else if (!compile_helper::build_host)
-                save_session_pipeline_cache(state_.context->vk, state_.info.device, state_.pipeline_cache_handle);
+                save_session_pipeline_cache(state_.context->vk, state_.info.device, state_.pipeline_cache_handle,
+                                            state_.offline_seed);
             state_.context->vk.vkDestroyPipelineCache(state_.info.device, state_.pipeline_cache_handle, nullptr);
         }
         state_.context.reset();
@@ -21763,8 +21911,8 @@ bool save_pipeline_caches_at_exit(unsigned wait_ms) {
             bool done = false;
         };
         auto write = std::make_shared<Write>();
-        std::thread([write, d] {
-            save_session_pipeline_cache(d->context->vk, d->info.device, d->pipeline_cache_handle, false, "exit");
+        std::thread([write, d, seed = d->offline_seed] {
+            save_session_pipeline_cache(d->context->vk, d->info.device, d->pipeline_cache_handle, seed, false, "exit");
             std::lock_guard done_lock(write->mutex);
             write->done = true;
             write->done_cv.notify_all();

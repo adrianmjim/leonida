@@ -4020,6 +4020,10 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_compile_teardown_one_worker COMMAND d3d12_compile_teardown_test)
       set_tests_properties(d3d12_compile_teardown_one_worker PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300
                            ENVIRONMENT "LEONIDA_COMPILE_THREADS=1")
+      # The session file beside an offline seed: loaded alone, the seed not read and nothing merged, when
+      # pipeline_cache.session.seed says it was written beside the seed there now; otherwise the seed and a merge.
+      add_test(NAME d3d12_session_cache_seed COMMAND d3d12_compile_teardown_test --seed)
+      set_tests_properties(d3d12_session_cache_seed PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
       # A buffer at the title's own VA (device slot 133) read by the same shader through a root view and a V#.
       add_executable(d3d12_title_va_test test/d3d12_title_va_test.cpp shims/d3d12_xs_device.cpp
                      test/xmem_geometry_aliases_stub.cpp ${LEONIDA_TEST_CS})
