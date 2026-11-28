@@ -302,6 +302,20 @@ def safe_folder_name(text: str) -> str:
     return cleaned or "mod"
 
 
+def portable_name(name: str) -> bool:
+    """True when `name` is a file or folder name Windows and POSIX both keep as written: no separator, control or
+    reserved character, no trailing dot or space, and not a device name (`NUL`, `con.txt`, `COM1 .log`).
+
+    This is the test for a name that already exists, such as a package member. `safe_folder_name` is not: it makes
+    a tidy folder label out of free text, so it also collapses runs of spaces and cuts at 80 characters, and a name
+    it would have written differently is not thereby unsafe."""
+    if not name or name in (".", "..") or name != name.rstrip(" ."):
+        return False
+    if any(ord(c) < 32 or c in '<>:"/\\|?*' for c in name):
+        return False
+    return name.split(".", 1)[0].rstrip(" ").upper() not in WINDOWS_RESERVED
+
+
 def simple_selector(name: str) -> str:
     if not name or name in (".", "..") or os.path.basename(name) != name:
         raise ModsError(f"{name!r} is not an installed mod folder name")
@@ -350,7 +364,7 @@ def zip_parts(name: str) -> tuple[str, ...]:
     if not parts or parts[0] == "/" or ".." in parts or "." in parts:
         raise ModsError(f"unsafe ZIP member name {name!r}")
     for part in parts:
-        if safe_folder_name(part) != part:
+        if not portable_name(part):
             raise ModsError(f"unsafe ZIP member name {name!r}")
     return parts
 
@@ -548,10 +562,15 @@ def pack_mod(mods_dir: str, selector: str, output: str, force: bool) -> str:
         dirs.sort()
         for name in sorted(files):
             full = os.path.join(base, name)
+            member = PurePosixPath(folder, os.path.relpath(full, path).replace(os.sep, "/")).as_posix()
+            try:
+                zip_parts(member)       # what install checks: a package this writes is one it accepts
+            except ModsError:
+                raise ModsError(f"{full} has a name a package cannot carry (install would refuse it); "
+                                "rename it and pack again") from None
             if same_report_path(output, full):
                 raise ModsError("the package output aliases a file in the mod being packed")
-            member = PurePosixPath(folder, os.path.relpath(full, path).replace(os.sep, "/"))
-            members.append((full, member.as_posix()))
+            members.append((full, member))
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
         for full, member in members:

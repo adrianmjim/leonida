@@ -55,7 +55,9 @@ python -I tools/leonida_mods.py --port "D:\Games\Leonida" disable mandy_prison_i
 python -I tools/leonida_mods.py --dir "D:\Games\Leonida\mods" check
 ```
 
-`pack` writes an installed folder back to a ZIP for sharing; `uninstall` removes it. `run` is a convenience
+`pack` writes an installed folder back to a ZIP for sharing; `uninstall` removes it. A package carries any file name
+that Windows and Linux both keep as written, whatever its length or the spaces inside it; `pack` stops at one that
+is not (a device name such as `con.txt`, a trailing dot, a `:`), since `install` would refuse it. `run` is a convenience
 launcher for the same options `gta6rt` already takes:
 
 ```powershell
