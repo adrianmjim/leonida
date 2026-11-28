@@ -865,10 +865,19 @@ State& g() {
     return *s;
 }
 
+bool matches(const Callback& c, const Event& e);
+
+// Under g().mu. Queues an event only when a registered callback wants it: GameInput dispatches callbacks, and with
+// none listening there is no work. Otherwise every reading (a pad's moving stick, a sensor pad's 125 Hz stream) would
+// queue an item nobody hears, and a title holding a dispatcher that runs one item a frame (Dispatch(0)) would fall
+// further behind every frame: a pad plugged in after start would have its connect event stuck behind that backlog and
+// never reach the title (RT-GAMEINPUT-LATE-PAD).
 void queue_event(const Event& e) {
+    State& s = g();
+    if (std::none_of(s.callbacks.begin(), s.callbacks.end(), [&e](const Callback& c) { return matches(c, e); })) return;
     if (e.device) e.device->AddRef();
     if (e.reading) e.reading->AddRef();
-    g().queue.push_back(e);
+    s.queue.push_back(e);
 }
 
 bool matches(const Callback& c, const Event& e) {
@@ -2424,7 +2433,13 @@ public:
         return r;
     }
     // Runs the queued callbacks on the caller's thread within the quota (see deliver_within).
-    bool STDMETHODCALLTYPE Dispatch(uint64_t quotaInMicroseconds) override { return deliver_within(quotaInMicroseconds); }
+    bool STDMETHODCALLTYPE Dispatch(uint64_t quotaInMicroseconds) override {
+        static std::atomic<bool> s_logged{false};
+        if (!s_logged.exchange(true))
+            std::fprintf(stderr, "[rt] gameinput: Dispatch first call (quota %llu us)\n",
+                         static_cast<unsigned long long>(quotaInMicroseconds));
+        return deliver_within(quotaInMicroseconds);
+    }
     HRESULT STDMETHODCALLTYPE OpenWaitHandle(HANDLE* handle) override {
         if (!handle) return E_POINTER;
         *handle = nullptr;
@@ -2648,6 +2663,15 @@ public:
         if (token) *token = kInvalidCallbackToken;
         if (!fn) return E_INVALIDARG;
         if (device && as_device(device)->info.deviceFamily == GameInputFamilyAggregate) return E_NOTIMPL;
+        // How a title learns of its pads decides whether one plugged in later reaches it, so the first few
+        // registrations are logged.
+        static std::atomic<int> s_logged{0};
+        if (s_logged.fetch_add(1) < 8)
+            std::fprintf(stderr, "[rt] gameinput: RegisterDeviceCallback(%s, kind 0x%x, status 0x%x, %s enumeration)\n",
+                         device ? "one device" : "all devices", kind, status_filter,
+                         enumeration == GameInputBlockingEnumeration ? "blocking"
+                         : enumeration == GameInputAsyncEnumeration  ? "async"
+                                                                     : "no");
         State& s = g();
         GameInputCallbackToken t;
         std::vector<Event> now;
@@ -2717,6 +2741,9 @@ public:
 
     HRESULT STDMETHODCALLTYPE CreateDispatcher(IGameInputDispatcher** out) override {
         if (!out) return E_POINTER;
+        static std::atomic<bool> s_logged{false};
+        if (!s_logged.exchange(true))
+            std::fprintf(stderr, "[rt] gameinput: CreateDispatcher first call (callbacks now run in Dispatch)\n");
         *out = new Dispatcher;
         return S_OK;
     }

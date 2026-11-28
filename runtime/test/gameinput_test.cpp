@@ -1715,6 +1715,65 @@ void test_haptic_motors(IGameInput* input) {
 
 }  // namespace
 
+// A pad plugged in after the title started, with the title holding a dispatcher (RT-GAMEINPUT-LATE-PAD). The title
+// registers its device callback with no pad present, a first pad arrives and is moved on every poll (the keyboard pad's
+// mouse stick), and the title runs one queued item a frame (Dispatch(0)). No reading callback is registered, so those
+// readings are work no callback wants: they must not queue ahead of the second pad's connect event.
+void test_late_pad_behind_dispatcher(IGameInput* input) {
+    check(rt::gameinput::connected_count() == 0, "late pad: nothing connected at the start");
+    IGameInputDispatcher* dispatcher = nullptr;
+    check(input->CreateDispatcher(&dispatcher) == S_OK && dispatcher, "late pad: CreateDispatcher");
+    if (!dispatcher) return;
+    GameInputCallbackToken token = 0;
+    check(input->RegisterDeviceCallback(nullptr, GameInputKindGamepad, GameInputDeviceConnected,
+                                        GameInputBlockingEnumeration, nullptr, on_device, &token) == S_OK,
+          "late pad: RegisterDeviceCallback with no pad present");
+    const auto connects_to_us = [&](IGameInputDevice** last) {
+        size_t n = 0;
+        for (const DeviceEvent& e : g_device_events)
+            if (e.token == token && e.previous == GameInputDeviceNoStatus && (e.current & GameInputDeviceConnected)) {
+                ++n;
+                if (last) *last = e.device;
+            }
+        return n;
+    };
+    Pad first, late;
+    attach(first, "Leonida virtual Xbox pad", 0x045E, 0x0B12, true);
+    rt::gameinput::poll();
+    while (dispatcher->Dispatch(0)) {}
+    check(connects_to_us(nullptr) == 1, "late pad: the first pad's connect reaches the callback");
+
+    int16_t x = 0;
+    const auto frame = [&] {  // four polls with the first pad's stick moving, then one item dispatched
+        for (int i = 0; i < 4; ++i) {
+            x = static_cast<int16_t>(x == 8000 ? -8000 : 8000);
+            SDL_SetJoystickVirtualAxis(first.js, SDL_GAMEPAD_AXIS_RIGHTX, x);
+            rt::gameinput::poll();
+        }
+        dispatcher->Dispatch(0);
+    };
+    for (int f = 0; f < 50; ++f) frame();
+    attach(late, "Leonida virtual DualSense", 0x054C, 0x0CE6, false, true);
+    for (int f = 0; f < 10 && connects_to_us(nullptr) < 2; ++f) frame();
+    IGameInputDevice* late_dev = nullptr;
+    check(connects_to_us(&late_dev) == 2 && late_dev && late_dev->GetDeviceInfo()->vendorId == 0x054C,
+          "late pad: a pad connected later reaches the callback within a few frames");
+    if (late_dev && late.js) {
+        SDL_SetJoystickVirtualButton(late.js, SDL_GAMEPAD_BUTTON_SOUTH, true);
+        rt::gameinput::poll();
+        IGameInputReading* r = current(input, late_dev);
+        check(buttons_of(r) & GameInputGamepadA, "late pad: its A press reads through the device it was handed");
+        if (r) r->Release();
+    }
+    input->UnregisterCallback(token, 0);
+    while (dispatcher->Dispatch(UINT64_MAX)) {}
+    dispatcher->Release();
+    detach(first);
+    detach(late);
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 0, "late pad: both pads closed");
+}
+
 int main(int argc, char** argv) {
     // Only virtual pads: no real controller on the test machine may show up.
     for (const char* hint : {SDL_HINT_JOYSTICK_HIDAPI, SDL_HINT_JOYSTICK_RAWINPUT, SDL_HINT_JOYSTICK_WGI,
@@ -2330,6 +2389,7 @@ int main(int argc, char** argv) {
     test_haptic_motors(input);
     test_raw_hid(input);
     test_raw_report_during_reconnect(input);
+    test_late_pad_behind_dispatcher(input);
     input->Release();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

@@ -530,6 +530,32 @@ class TestCli(unittest.TestCase):
             with open(out, encoding="utf-8") as fh:
                 self.assertEqual(fh.read(), "previous report\n")
 
+    def test_unlistable_folder_case_alias_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir, locked, xml = self._locked_tree(tmp)
+            out = os.path.join(locked, "names.csv")
+            with open(out, "w", encoding="utf-8") as fh:
+                fh.write("previous report\n")
+            alias = os.path.join(src_dir, "LOCKED", "names.csv")
+            original_isfile = os.path.isfile
+            original_compare = names_mod.same_report_path
+
+            def isfile(path):
+                return path == alias or original_isfile(path)
+
+            def compare(first, second):
+                if first == os.path.dirname(alias) and second == locked:
+                    return True  # emulate a case-insensitive volume
+                return original_compare(first, second)
+
+            with mock.patch.object(names_mod.os.path, "isfile", side_effect=isfile), \
+                    mock.patch.object(names_mod, "same_report_path", side_effect=compare):
+                code, err = self._run_with_locked_folder(src_dir, locked, xml, alias)
+            self.assertEqual(code, 2, err)
+            self.assertIn("cannot list", err)
+            with open(out, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "previous report\n")
+
     def test_unlistable_sub_folder_gives_the_same_result_whether_or_not_the_report_exists(self):
         # An --out outside the unlistable folder is not refused by the check, so the run does not depend on
         # whether a report is already there: the scan stops on the folder with exit 1 both times and leaves an

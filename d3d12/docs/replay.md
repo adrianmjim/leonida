@@ -93,7 +93,7 @@ targets (where the viewport has the picture's shape), dispatches and draws with
 the textures of the picture's shape shaders may write at that time, copies,
 resolves and clears. `--of` is the size of the picture the point was read from
 (a screenshot's). The commands are numbered `<list>:<command>` as in
-`--listing`, `--slots` and `--looks`.
+`--listing`, `--slots` and `--flow`.
 
 | switch | does |
 |---|---|

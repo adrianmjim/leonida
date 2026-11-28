@@ -363,7 +363,11 @@ button) run on that thread, as GameInput runs them on its own threads. Once the 
 `IGameInputDispatcher::Dispatch` runs them on the title's thread, oldest first, within its quota: at least one queued
 event per call (a quota of 0 runs exactly one), no further event once the quota has passed, and only the events
 queued when the call started (later ones wait for the next call, so even an unlimited quota returns). The wait
-handle is signalled again while events remain.
+handle is signalled again while events remain. An event is queued only when a registered callback wants it (a
+reading with no reading callback, say, is no work), so readings nobody hears cannot build a backlog that a title
+running one item a frame (`Dispatch(0)`) never catches up on, with a later pad's connect event stuck behind it. The
+first few `RegisterDeviceCallback` calls (filter, kind, status filter, enumeration) and the first `CreateDispatcher`
+and `Dispatch` calls are logged, since they decide how the title hears of a pad plugged in after start.
 
 The API surface:
 

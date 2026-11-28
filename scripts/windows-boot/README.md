@@ -69,9 +69,11 @@ faults:   none
 frames:   14 captured, 0 non-black; last mean rgb 0.00 0.00 0.00; brightest 0.00 0.00 0.00
 ```
 
-`-DigestOnly -Name <name>` writes the summary and digest again for an earlier run. The digest holds counts and
-states only, which is what goes into a RESULT on the board; the logs, traces, captures and dumps can quote the game
-and stay on your machine ([AGENTS.md](../../AGENTS.md), "No game data").
+`-DigestOnly -Name <name>` writes the summary and digest again for an earlier run. The `faults` row reports whether
+the log recorded device loss and counts Vulkan address records by type (for example, `WRITE_INVALID=2`).
+Several records can describe one loss. A driver can also report loss without any address records.
+Share counts and states on the board. Keep paths, logs, traces, captures and dumps on your machine
+([AGENTS.md](../../AGENTS.md), "No game data").
 
 How to read the states: game state goes 1, 2 (init), 3 (running); session state goes 0, 1, 3 (landing
 screen waiting for A), `d` after A.

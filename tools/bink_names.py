@@ -50,6 +50,7 @@ if ROOT not in sys.path:
 import bink_index  # noqa: E402
 import gamedata_index  # noqa: E402
 from file_mode import published_mode  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
 import gamedata_xml  # noqa: E402
 
@@ -404,6 +405,18 @@ def _write_report_body(fh_or_path, rows, unmatched, summary, json_out=None):
         w.writerows(rows)
 
 
+def _inside_folder(path, folder):
+    """Whether a report path is inside a folder, including filesystem aliases."""
+    ancestor = os.path.realpath(os.path.abspath(path))
+    while True:
+        if same_report_path(ancestor, folder):
+            return True
+        parent = os.path.dirname(ancestor)
+        if parent == ancestor:
+            return False
+        ancestor = parent
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="an .rpf archive, a directory, or a bink_index.py CSV/JSON")
@@ -434,13 +447,7 @@ def main(argv=None):
             # be an input this check never saw, so refuse it. Any other unlistable folder is left to the scan,
             # which stops on it with exit 1 whether or not the report already exists.
             locked = error.filename or folder
-            out_key = os.path.normcase(os.path.realpath(a.out))
-            locked_key = os.path.normcase(os.path.realpath(locked))
-            try:
-                inside = os.path.commonpath([out_key, locked_key]) == locked_key
-            except ValueError:  # different drives on Windows
-                inside = False
-            if inside:
+            if _inside_folder(a.out, locked):
                 ap.error(f"--out cannot be checked against the inputs: cannot list {locked}: "
                          f"{error.strerror or error}")
 
