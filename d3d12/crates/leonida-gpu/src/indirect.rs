@@ -3854,6 +3854,98 @@ void main(uint3 g : SV_GroupID) {
         }
     }
 
+    const WRITER_CS: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer args : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    args.Store3(0, uint3(7, 1, 1));
+}
+"#;
+
+    /// A record a shader writes behind a batch's pass: the batch has it as it was before the
+    /// writer (what `LEONIDA_INDIRECT_BATCH=2` executed: the title's culling passes write the
+    /// arguments of executions right behind them, with no wait between), and the list says so
+    /// by the record's address (`HostList::shaders_wrote_since`), so that it is clamped anew
+    /// in a batch behind the writer (4). A record the writer is not bound to is still read
+    /// from the first batch.
+    #[test]
+    fn a_record_written_behind_a_batchs_pass_is_clamped_behind_its_writer() {
+        const READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        const WRITTEN: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        // Where the title has the records (32 bytes apart).
+        const TITLE: u64 = 0x10_0000;
+        let Some(host) = super::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        let writer = compile_cs(&host.device, WRITER_CS).expect("writer shader must compile");
+        let signature = one_argument(&host.device, 2, 12);
+        let (Some((source, ptr)), Some((hits_buf, hits_ptr))) = (host.shared_buffer(1024), host.shared_buffer(256)) else {
+            return;
+        };
+        // Records 0 and 1: 1 group and 20.
+        for (i, x) in [1u32, 20].into_iter().enumerate() {
+            for (w, word) in [x, 1, 1].into_iter().enumerate() {
+                // SAFETY: inside the mapping.
+                unsafe { ptr.cast::<u32>().add(i * 8 + w).write_volatile(word) };
+            }
+        }
+        // SAFETY: the mapping holds 256 bytes; nothing runs.
+        unsafe { std::ptr::write_bytes(hits_ptr, 0, 256) };
+        // SAFETY: live buffers.
+        let (source_gpu, hits_gpu) = unsafe { (source.GetGPUVirtualAddress(), hits_buf.GetGPUVirtualAddress()) };
+        let run = |table: &mut batch::Table, scratch: &ID3D12Resource, record: u64| {
+            let at = table.place(1, record * 32, 2).unwrap();
+            // SAFETY: an open list; the worker's root signature and pipeline; buffers the test
+            // holds until the list has run.
+            unsafe {
+                list.list.SetComputeRootSignature(&worker.root);
+                list.list.SetPipelineState(&worker.pso);
+                list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                list.list.ExecuteIndirect(&signature, 1, scratch, at, None, 0);
+            }
+        };
+        // SAFETY: an open list and a live buffer in that state.
+        unsafe { list.list.ResourceBarrier(&[crate::host::transition(&source, D3D12_RESOURCE_STATE_COMMON, READ)]) };
+        let (mut first, first_scratch) = open_batch(&list, (1, &source), &[]).unwrap();
+        list.batch_opened();
+        run(&mut first, &first_scratch, 1);
+        // The title's culling pass, bound to record 0 alone, and nothing the layer waits at.
+        // SAFETY: as above; the writer's root signature and pipeline.
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::transition(&source, READ, WRITTEN)]);
+            list.list.SetComputeRootSignature(&writer.root);
+            list.list.SetPipelineState(&writer.pso);
+            list.list.SetComputeRootUnorderedAccessView(0, source_gpu);
+            list.list.Dispatch(1, 1, 1);
+            list.list.ResourceBarrier(&[crate::host::transition(&source, WRITTEN, READ)]);
+        }
+        list.shaders_write(TITLE, 12);
+        assert!(!list.shaders_wrote_since(TITLE + 32, 12), "record 1 is as the pass read it");
+        assert!(list.shaders_wrote_since(TITLE, 12), "record 0 may be another");
+        run(&mut first, &first_scratch, 1);
+        // Record 0 from the first batch, as 2 read it: the group it had before the writer.
+        run(&mut first, &first_scratch, 0);
+        // And from a batch behind the writer, as 4 reads it: the 7 groups written.
+        let (mut second, second_scratch) = open_batch(&list, (1, &source), &[]).unwrap();
+        list.batch_opened();
+        assert!(!list.shaders_wrote_since(TITLE, 12), "nothing is bound to it behind the second pass");
+        run(&mut second, &second_scratch, 0);
+        list.close();
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+        host.execute(&[&list]);
+        list.reset();
+        // SAFETY: the list has run; a mapped buffer.
+        let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
+        assert_eq!(hits, 20 + 20 + 1 + 7, "the first batch has record 0 as it was, the second as written");
+    }
+
     /// What clamps of a frame cost on the card one by one and in batches
     /// (ignored: a measurement): 2,355 executions of an empty dispatch, in
     /// 49 lists' worth of runs, as in the captured frame.

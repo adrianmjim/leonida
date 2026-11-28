@@ -3133,6 +3133,13 @@ struct Deferred {
     /// The title memory shaders of this list may write through buffer views
     /// ([`HostList::shaders_write`]), since its reset.
     shader_spans: Spans,
+    /// Of it, what was declared since the list's open batch of indirect records was opened
+    /// ([`HostList::batch_opened`]; `LEONIDA_INDIRECT_BATCH=4`).
+    batch_spans: Spans,
+    /// Diagnostics (`LEONIDA_BATCH_WHY=1`): the program bound now, and every range declared
+    /// since the batch was opened with the program it was declared for.
+    #[cfg(feature = "diagnostics")]
+    batch_writers: (std::sync::Arc<str>, Vec<(u64, u64, std::sync::Arc<str>)>),
     /// Of them, those the list's prelude copies into their host copies if
     /// the submission finds them changed ([`HostList::upload_in_prelude`]).
     prelude_uploads: Vec<crate::texture::PreludeUpload>,
@@ -4986,6 +4993,8 @@ fn late_line(frames: f64) {
     crate::texture::alias_line(frames);
     #[cfg(feature = "diagnostics")]
     crate::draw::dispatch_sizes_line(frames);
+    #[cfg(feature = "diagnostics")]
+    crate::draw::batch_why_line(frames);
     crate::watch::port_guard_line(frames);
     #[cfg(feature = "diagnostics")]
     crate::watch::fault_asks_line(frames);
@@ -8543,7 +8552,52 @@ impl HostList {
     /// kept until the list is reset, for [`HostList::shaders_wrote`]. Only kept where it is
     /// asked (`crate::draw::batch_spans`).
     pub(crate) fn shaders_write(&self, address: u64, len: u64) {
-        self.deferred().shader_spans.add(address, address.saturating_add(len));
+        let mut deferred = self.deferred();
+        let end = address.saturating_add(len);
+        deferred.shader_spans.add(address, end);
+        deferred.batch_spans.add(address, end);
+        #[cfg(feature = "diagnostics")]
+        if crate::draw::batch_why() && end > address {
+            let writer = deferred.batch_writers.0.clone();
+            if deferred.batch_writers.1.len() < 4096 {
+                deferred.batch_writers.1.push((address, end, writer));
+            }
+        }
+    }
+
+    /// A batch of indirect records was opened in this list: what its shaders may write is
+    /// kept anew from here ([`HostList::shaders_wrote_since`]).
+    pub(crate) fn batch_opened(&self) {
+        let mut deferred = self.deferred();
+        deferred.batch_spans = Spans::default();
+        #[cfg(feature = "diagnostics")]
+        deferred.batch_writers.1.clear();
+    }
+
+    /// Whether shaders this list was told of ([`HostList::shaders_write`]) since its open batch
+    /// was opened ([`HostList::batch_opened`]) may write any of `[address, address + len)` of
+    /// title memory: a record there has to be clamped behind them, in another batch.
+    pub(crate) fn shaders_wrote_since(&self, address: u64, len: u64) -> bool {
+        self.deferred().batch_spans.touches(address, address.saturating_add(len))
+    }
+
+    /// Diagnostics (`LEONIDA_BATCH_WHY=1`): the program whose views are declared from here on.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn batch_writer(&self, name: &str) {
+        let mut deferred = self.deferred();
+        if &*deferred.batch_writers.0 != name {
+            deferred.batch_writers.0 = name.into();
+        }
+    }
+
+    /// Diagnostics (`LEONIDA_BATCH_WHY=1`): the last range declared since the batch was opened
+    /// that reaches into `[address, address + len)`: its bytes and its program.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn batch_writer_of(&self, address: u64, len: u64) -> Option<(u64, u64, std::sync::Arc<str>)> {
+        let end = address.saturating_add(len);
+        let deferred = self.deferred();
+        let hit = deferred.batch_writers.1.iter().rev().find(|w| w.0 < end && address < w.1)?;
+        Some((hit.0, hit.1 - hit.0, hit.2.clone()))
     }
 
     /// Whether shaders recorded in this list so far may have written any of

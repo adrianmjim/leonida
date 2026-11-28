@@ -653,11 +653,29 @@ fn in_place_order() -> bool {
 /// recorded before it, and what is recorded after it is told apart by address.
 /// Standing at the waterside save on an RTX 4060 Ti (2026-11-28): 1,150 batch passes a frame
 /// with 1; with 2 switched in turns of 4 s the frame is 6.5 ms shorter (+-0.8, of 78).
+///
+/// `LEONIDA_INDIRECT_BATCH=4`: as 3, but by what was declared since the batch's own pass
+/// ([`HostList::shaders_wrote_since`]), not since the list's reset: 3 ended a batch for every
+/// record in memory any storing shader of the list had ever been bound to, and the culling
+/// passes at a list's start are bound to the argument buffers its every later execution reads.
+/// A list is told of every buffer view a storing shader gets for unordered access at each bind
+/// of it (tables with such a view are gone through at every bind, root views are declared at
+/// every bind), so the ranges kept since a pass are those of the shaders recorded behind it:
+/// a record outside them is as the pass read it. A shader that can store to buffers by other
+/// ways than a view bound to it (by address, through a view it picks from the heap by a number
+/// it computes or per lane, at an offset in a table it computes, past the first view of a range,
+/// code that is not all known or not followed, the structure builder) ends the batch, as with 1
+/// ([`stores_declared`]). Copies the title places in the list end it in every setting.
+/// (Switched with `LEONIDA_AB` between 2 and 4 the first batches of 4 after a phase of 2 may
+/// have missed a store by address made during it: measure 4 against 1 for the picture.)
 fn batches() -> u8 {
-    // (`LEONIDA_AB=<s>,LEONIDA_INDIRECT_BATCH_2` or `..._3`: 2 or 3 while that switch is on,
-    // so that one run measures it against the setting in one scene.)
+    // (`LEONIDA_AB=<s>,LEONIDA_INDIRECT_BATCH_2`, `..._3` or `..._4`: that setting while the
+    // switch is on, so that one run measures it against the setting in one scene.)
     #[cfg(feature = "diagnostics")]
     {
+        if crate::ab::pick("LEONIDA_INDIRECT_BATCH_4") == Some(true) {
+            return 4;
+        }
         if crate::ab::pick("LEONIDA_INDIRECT_BATCH_3") == Some(true) {
             return 3;
         }
@@ -675,33 +693,147 @@ fn batches_set() -> u8 {
         Ok("0") => 0,
         Ok("2") => 2,
         Ok("3") => 3,
+        Ok("4") => 4,
         _ => 1,
     })
 }
 
 /// Whether lists keep what their shaders may write ([`HostList::shaders_write`]): with
-/// `LEONIDA_INDIRECT_BATCH=3`, or while `LEONIDA_AB` can turn it on.
+/// `LEONIDA_INDIRECT_BATCH=3` or `4`, or while `LEONIDA_AB` can turn one of them on.
 pub(crate) fn batch_spans() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         #[cfg(feature = "diagnostics")]
-        if crate::ab::bit("LEONIDA_INDIRECT_BATCH_3").is_some() {
+        if crate::ab::bit("LEONIDA_INDIRECT_BATCH_3").is_some() || crate::ab::bit("LEONIDA_INDIRECT_BATCH_4").is_some() || batch_why() {
             return true;
         }
-        batches_set() == 3
+        matches!(batches_set(), 3 | 4)
     })
 }
 
 /// Whether an execution cannot read its record from the open batch ([`batches`], by its
 /// setting `mode`): `wrote`, shaders that can store to buffers were recorded since the batch's
-/// pass; `record_written`, this list has declared the record's bytes as written by shaders.
+/// pass; `in_list`, this list has declared the record's bytes as written by shaders; `since`,
+/// it has done so since the batch's pass.
 /// With 1 (and 0) no batch stays open past such shaders, so one that is (the setting changed
-/// while the title ran) ends; with 2 only the title's waits and draws end it.
-fn batch_stale(mode: u8, wrote: bool, record_written: impl FnOnce() -> bool) -> bool {
+/// while the title ran) ends; with 2 only the title's waits and draws end it. With 4 the mark
+/// is not asked: a range declared since the pass is one a shader behind the pass may write.
+fn batch_stale(mode: u8, wrote: bool, in_list: impl FnOnce() -> bool, since: impl FnOnce() -> bool) -> bool {
     match mode {
         2 => false,
-        3 => wrote && record_written(),
+        3 => wrote && in_list(),
+        4 => since(),
         _ => wrote,
+    }
+}
+
+/// Whether all that the shaders of `p` can store to buffers goes through views bound to it,
+/// which a list is told of at every bind (`crate::shadow::Shadow::gpu_writes`): no stage that
+/// stores does so otherwise than through a buffer view
+/// (`crate::pipeline::Translated::stores_past_views`) or picks its views from the heap by a
+/// number it computes (what it writes through one of those is declared nowhere:
+/// [`State::heap_buffers`]), and every store of every stage goes through a table entry or root
+/// view that the bind declares (`crate::pipeline::stores_bound`: not a view picked per lane, at
+/// an offset the program computes or past the first of a range; no until a thread of its own
+/// has looked). `builder`: it is the structure builder's, whose stores are not declared while it
+/// is quarantined.
+fn stores_declared(p: &HostPipeline, builder: bool) -> bool {
+    !builder
+        && p.stages.iter().all(|stage| {
+            let t = stage.translated();
+            !t.stores
+                || (!(t.stores_past_views || t.host.root_srvs.contains(&leonida_shader::emit::SLOT_STRIDES))
+                    && crate::pipeline::stores_bound(&stage.shader, t))
+        })
+}
+
+/// Diagnostics: why [`stores_declared`] says no of `p`, for the first stage that stores.
+#[cfg(feature = "diagnostics")]
+fn undeclared_why(p: &HostPipeline, builder: bool) -> &'static str {
+    if builder {
+        return "the structure builder";
+    }
+    for stage in &p.stages {
+        let t = stage.translated();
+        if !t.stores {
+            continue;
+        }
+        if t.stores_by_address {
+            return "stores by address";
+        }
+        if t.stores_past_views {
+            return "scalar stores or code not known";
+        }
+        if t.host.root_srvs.contains(&leonida_shader::emit::SLOT_STRIDES) {
+            return "views picked from the heap";
+        }
+        if !crate::pipeline::stores_bound(&stage.shader, t) {
+            return "a view not declared at its bind, or not looked at yet";
+        }
+    }
+    "?"
+}
+
+/// Diagnostics: `LEONIDA_BATCH_WHY=1` counts what ends indirect batches and by which
+/// programs' declared ranges ([`batch_why_line`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn batch_why() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("LEONIDA_BATCH_WHY"))
+}
+
+/// Since the last frame-rate line ([`batch_why`]): batches opened; batches ended by a shader
+/// that stores (1, 0, and with 2 at the title's next wait or draw), by a shader whose stores
+/// are not all declared (4), by a copy, for a record declared written (3, 4), for a full
+/// table or another source; executions that read from a batch.
+#[cfg(feature = "diagnostics")]
+static BATCH_WHY: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// By writer and reader program ([`batch_why`]): how often a record the reader executes lay
+/// in a range declared for the writer since the batch's pass, and the smallest and largest
+/// such range.
+#[cfg(feature = "diagnostics")]
+type BatchPairs = std::collections::HashMap<(std::sync::Arc<str>, String, u32), (u64, u64, u64)>;
+#[cfg(feature = "diagnostics")]
+static BATCH_PAIRS: std::sync::Mutex<Option<BatchPairs>> = std::sync::Mutex::new(None);
+
+/// By program ([`batch_why`]): batches ended by it because not all it stores is declared (4).
+#[cfg(feature = "diagnostics")]
+static BATCH_UNDECLARED: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> = std::sync::Mutex::new(None);
+
+/// For the frame-rate line: what ended indirect batches ([`BATCH_WHY`]) and the pairs of
+/// programs behind the records declared written ([`BATCH_PAIRS`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn batch_why_line(frames: f64) {
+    if !batch_why() {
+        return;
+    }
+    let [opened, stored, undeclared, copied, written, full, read] =
+        [0, 1, 2, 3, 4, 5, 6].map(|i: usize| BATCH_WHY[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    tracing::info!(
+        "indirect batches per frame (LEONIDA_INDIRECT_BATCH={}): {opened:.0} opened; ended by a storing shader {stored:.0}, by one whose \
+         stores are not all declared {undeclared:.0}, by a copy {copied:.0}, for a record declared written since the pass {written:.0}, \
+         for a full table or another source {full:.0}; {read:.0} executions read from an open batch",
+        batches()
+    );
+    let said = crate::pipeline::BOUND_SAID.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+    let undeclared = BATCH_UNDECLARED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    let mut undeclared: Vec<_> = undeclared.into_iter().collect();
+    undeclared.sort_by_key(|u| std::cmp::Reverse(u.1));
+    tracing::info!(
+        "  shaders looked at since: {} store through bound views alone, {} not; ended for undeclared stores: {}",
+        said[0],
+        said[1],
+        undeclared.iter().take(8).map(|(name, n)| format!("{name} {:.1}", *n as f64 / frames)).collect::<Vec<_>>().join(", ")
+    );
+    let pairs = BATCH_PAIRS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    let mut pairs: Vec<_> = pairs.into_iter().collect();
+    pairs.sort_by_key(|p| std::cmp::Reverse(p.1.0));
+    for ((writer, reader, kind), (n, least, most)) in pairs.into_iter().take(24) {
+        tracing::info!(
+            "  records declared written since the pass: {:.1} a frame, declared for {writer}, executed (kind {kind}) by {reader}; ranges of {least} to {most} bytes",
+            n as f64 / frames
+        );
     }
 }
 
@@ -854,6 +986,10 @@ pub(crate) struct State {
     /// The records clamped in a batch, if later executions may still read
     /// them ([`batches`]).
     batch: Option<Batch>,
+    /// The last bind left a table a storing stage writes through without going through its
+    /// views (no heap or host heap for it, not on a descriptor, too big): what it writes there
+    /// was declared nowhere (`LEONIDA_INDIRECT_BATCH=4`, [`State::stores_told`]).
+    views_untold: bool,
     /// The host list has had a wait for every shader write, and nothing
     /// recorded since can write through unordered access
     /// ([`State::wait_for_writes`]).
@@ -2354,6 +2490,11 @@ impl State {
         if compute || p.stages.iter().any(|stage| stage.translated().writes) {
             self.waited = false;
         }
+        #[cfg(feature = "diagnostics")]
+        if batch_why() {
+            list.batch_writer(&p.name);
+        }
+        self.views_untold = false;
         // (Clears the cache if the switch changed since the last call.)
         self.cache.sync();
         // Textures picked by index, before anything asks for them.
@@ -4553,18 +4694,21 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    /// (False if the entry's view was not gone through: no table, heap or view of it.)
+    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) -> bool {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
-            return;
+            return false;
         };
         let handle = table + u64::from(u.table_offset_dwords) * 4;
         let Some(heap) = self.heap_of(handle) else {
-            return;
+            return false;
         };
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
-            return;
+            return false;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
+        let mirrored = host.mirror(index, handle, true);
+        let went = mirrored.is_some();
+        if let Some(view) = mirrored {
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
@@ -4598,6 +4742,7 @@ impl State {
                 }
             }
         }
+        went
     }
 
     /// The descriptors a shader reads through tables. Tables holding a
@@ -4669,10 +4814,16 @@ impl State {
                 );
             }
         }
+        // (A view of unordered access a storing stage has that is not gone through here was
+        // declared nowhere: `views_untold`.)
+        let storing = STORES.get();
         for &(g, e) in &plan.direct {
             let group = &plan.groups[g];
             if !selected_slot(&fresh, group.slot) {
-                self.table_entry(list, &group.entries[e], compute);
+                let u = &group.entries[e];
+                if !self.table_entry(list, u, compute) && u.kind == ResourceType::Uav && storing {
+                    self.views_untold = true;
+                }
             }
         }
         let mut made = Few::default();
@@ -4681,17 +4832,22 @@ impl State {
             if !selected_slot(&fresh, slot) {
                 continue;
             }
+            let untold = group.has_uav && storing;
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                self.views_untold |= untold;
                 continue;
             };
             let entries = &group.entries;
             let Some(heap) = self.heap_of(table) else {
+                self.views_untold |= untold;
                 continue;
             };
             if heap.samplers() || (table - heap.start) % 32 != 0 {
+                self.views_untold |= untold;
                 continue;
             }
             let Some(host) = heap.host() else {
+                self.views_untold |= untold;
                 continue;
             };
             let mut selected: Vec<u32> = group
@@ -4725,6 +4881,7 @@ impl State {
                 || last.and_then(|handle| heap.index(handle)).is_none()
             {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
+                self.views_untold |= untold;
                 continue;
             }
             // The table and what its entries hold (record words).
@@ -4884,6 +5041,8 @@ impl State {
                                     LIST_ALIAS[1].fetch_add(1, Ordering::Relaxed);
                                 }
                             }
+                        } else if kind == ResourceType::Uav && storing {
+                            self.views_untold = true;
                         }
                     }
                     if let Some(title) = title_first
@@ -5187,8 +5346,44 @@ impl State {
     fn buffers_written(&mut self) {
         match &mut self.batch {
             Some(batch) if batches() >= 2 => batch.wrote = true,
-            batch => *batch = None,
+            batch => {
+                #[cfg(feature = "diagnostics")]
+                if batch.is_some() && batch_why() {
+                    BATCH_WHY[1].fetch_add(1, Ordering::Relaxed);
+                }
+                *batch = None;
+            }
         }
+    }
+
+    /// With `LEONIDA_INDIRECT_BATCH=4`: a dispatch or draw of `p` was recorded whose shaders
+    /// can store to buffers. Whether the open batch stays open past it: only if all it can
+    /// store goes through views the list was told of when it was bound ([`stores_declared`]),
+    /// and the bind went through all of them ([`State::views_untold`]); what it may have
+    /// written is then known by address when a record is asked for.
+    fn stores_told(&mut self, p: &HostPipeline) -> bool {
+        if batches() != 4 {
+            return false;
+        }
+        if !self.views_untold && stores_declared(p, crate::pipeline::is_builder(self.pipeline as This)) {
+            if let Some(batch) = &mut self.batch {
+                batch.wrote = true;
+            }
+        } else {
+            #[cfg(feature = "diagnostics")]
+            if self.batch.is_some() && batch_why() {
+                BATCH_WHY[2].fetch_add(1, Ordering::Relaxed);
+                let why = if self.views_untold {
+                    "a table its bind did not go through"
+                } else {
+                    undeclared_why(p, crate::pipeline::is_builder(self.pipeline as This))
+                };
+                let mut by = BATCH_UNDECLARED.lock().unwrap_or_else(|e| e.into_inner());
+                *by.get_or_insert_with(Default::default).entry(format!("{} ({why})", p.name)).or_default() += 1;
+            }
+            self.batch = None;
+        }
+        true
     }
 
     /// Leonida: a dispatch with the pipeline `p` was recorded: as
@@ -5204,7 +5399,9 @@ impl State {
         if !crate::toggled!("LEONIDA_BATCH_TEXTURE_DISPATCHES")
             || p.stages.iter().any(|stage| stage.translated().stores)
         {
-            self.buffers_written();
+            if !self.stores_told(p) {
+                self.buffers_written();
+            }
         }
     }
 
@@ -5212,10 +5409,21 @@ impl State {
     /// if its shaders can store to buffers).
     fn drew(&mut self, p: Option<&HostPipeline>) {
         if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)) {
+            // (With 4 a known pipeline's stores are told apart by address, if they are all
+            // declared.)
+            if p.is_some_and(|p| self.stores_told(p)) {
+                return;
+            }
             // (With 3 a known pipeline's stores are told apart by address, as a dispatch's.)
             match &mut self.batch {
                 Some(batch) if p.is_some() && batches() == 3 => batch.wrote = true,
-                batch => *batch = None,
+                batch => {
+                    #[cfg(feature = "diagnostics")]
+                    if batch.is_some() && batch_why() {
+                        BATCH_WHY[1].fetch_add(1, Ordering::Relaxed);
+                    }
+                    *batch = None;
+                }
             }
         }
     }
@@ -5223,6 +5431,10 @@ impl State {
     /// A buffer was copied to: what was clamped of it ahead is clamped anew.
     pub(crate) fn copied(&mut self) {
         self.window = None;
+        #[cfg(feature = "diagnostics")]
+        if self.batch.is_some() && batch_why() {
+            BATCH_WHY[3].fetch_add(1, Ordering::Relaxed);
+        }
         self.batch = None;
     }
 
@@ -5252,8 +5464,12 @@ impl State {
 
     /// The title waits for earlier work (a barrier or a pipeline sync).
     pub(crate) fn synced(&mut self) {
-        // (Not with 3: there an execution's own record says whether the batch has it.)
-        if batches() != 3 && self.batch.as_ref().is_some_and(|b| b.wrote) {
+        // (Not with 3 and 4: there an execution's own record says whether the batch has it.)
+        if !matches!(batches(), 3 | 4) && self.batch.as_ref().is_some_and(|b| b.wrote) {
+            #[cfg(feature = "diagnostics")]
+            if batch_why() {
+                BATCH_WHY[1].fetch_add(1, Ordering::Relaxed);
+            }
             self.batch = None;
         }
     }
@@ -5281,18 +5497,55 @@ impl State {
             self.synced();
         }
         let (id, offset) = (args.id(), args.offset(arguments));
-        // (`len` bytes at `arguments`: the record, for `LEONIDA_INDIRECT_BATCH=3`.)
-        if let Some(b) = &mut self.batch
-            && !batch_stale(batches(), b.wrote, || list.shaders_wrote(arguments, len))
-            && let Some(at) = b.table.place_packed(id, offset, kind, pack)
-        {
-            return Some((b.scratch.clone(), at));
+        // (`len` bytes at `arguments`: the record, for `LEONIDA_INDIRECT_BATCH=3` and `4`.)
+        if let Some(b) = &mut self.batch {
+            let mode = batches();
+            let stale =
+                batch_stale(mode, b.wrote, || list.shaders_wrote(arguments, len), || list.shaders_wrote_since(arguments, len));
+            // (What ends batches, and which records 2 reads that a shader behind the pass was
+            // bound to write.)
+            #[cfg(feature = "diagnostics")]
+            if batch_why() {
+                if stale && matches!(mode, 3 | 4) {
+                    BATCH_WHY[4].fetch_add(1, Ordering::Relaxed);
+                }
+                if (stale || b.wrote)
+                    && let Some((_, bytes, writer)) = list.batch_writer_of(arguments, len)
+                {
+                    let reader = crate::pipeline::host_pipeline(self.pipeline as This).map_or_else(String::new, |p| p.name.clone());
+                    let mut pairs = BATCH_PAIRS.lock().unwrap_or_else(|e| e.into_inner());
+                    let pair = pairs.get_or_insert_with(Default::default).entry((writer, reader, kind)).or_insert((0, u64::MAX, 0));
+                    *pair = (pair.0 + 1, pair.1.min(bytes), pair.2.max(bytes));
+                }
+            }
+            if !stale {
+                if let Some(at) = b.table.place_packed(id, offset, kind, pack) {
+                    #[cfg(feature = "diagnostics")]
+                    if batch_why() {
+                        BATCH_WHY[6].fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Some((b.scratch.clone(), at));
+                }
+                #[cfg(feature = "diagnostics")]
+                if batch_why() {
+                    BATCH_WHY[5].fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
         self.batch = None;
         let opened = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args));
         self.clamped();
+        // What shaders are bound to write is kept from this pass on (with 4: the execution
+        // itself is bound after this, and what it writes is another execution's record).
+        if batch_spans() {
+            list.batch_opened();
+        }
         let (mut table, scratch) = opened?;
         let at = table.place_packed(id, offset, kind, pack)?;
+        #[cfg(feature = "diagnostics")]
+        if batch_why() {
+            BATCH_WHY[0].fetch_add(1, Ordering::Relaxed);
+        }
         self.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
         Some((scratch, at))
     }
@@ -5668,15 +5921,61 @@ mod batch_tests {
     /// waits and draws), and with 1 no batch is open past such shaders.
     #[test]
     fn a_batch_ends_for_a_record_shaders_may_have_written_since_its_pass() {
+        let no = || -> bool { panic!("not asked") };
         // 3: nothing recorded since the pass that stores: the record is not even looked up
-        assert!(!batch_stale(3, false, || panic!("not asked")));
+        assert!(!batch_stale(3, false, no, no));
         // 3: storing shaders since, elsewhere: the batch has the record
-        assert!(!batch_stale(3, true, || false));
+        assert!(!batch_stale(3, true, || false, no));
         // 3: storing shaders since, and the record lies where shaders of the list write
-        assert!(batch_stale(3, true, || true));
-        assert!(!batch_stale(2, true, || panic!("not asked")));
-        assert!(batch_stale(1, true, || panic!("not asked")));
-        assert!(!batch_stale(1, false, || panic!("not asked")));
+        assert!(batch_stale(3, true, || true, no));
+        assert!(!batch_stale(2, true, no, no));
+        assert!(batch_stale(1, true, no, no));
+        assert!(!batch_stale(1, false, no, no));
+        // 4: only what was declared since the pass counts, whatever the list declared before
+        // it and whether or not a storing shader was marked
+        assert!(!batch_stale(4, true, no, || false));
+        assert!(batch_stale(4, true, no, || true));
+        assert!(batch_stale(4, false, no, || true));
+    }
+
+    /// With 4 a list keeps what its shaders are bound to write since its open batch's pass:
+    /// a record a culling pass was bound to before the pass is read from the batch, one a
+    /// shader is bound to behind the pass is not, and the next batch begins with nothing.
+    #[test]
+    fn what_shaders_may_write_is_kept_since_the_pass() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        // A culling pass at the list's start, bound to an argument buffer of 64 records.
+        list.shaders_write(0x1000, 64 * 32);
+        assert!(list.shaders_wrote(0x1000 + 5 * 32, 12));
+        assert!(list.shaders_wrote_since(0x1000 + 5 * 32, 12));
+        // A batch is opened behind it: its pass reads the records as that pass left them.
+        list.batch_opened();
+        assert!(list.shaders_wrote(0x1000 + 5 * 32, 12), "3 still ends the batch for it");
+        assert!(!list.shaders_wrote_since(0x1000 + 5 * 32, 12), "4 reads it from the batch");
+        // A skinning pass behind the batch's pass, bound to other memory: nothing changes.
+        list.shaders_write(0x9000, 4096);
+        assert!(!list.shaders_wrote_since(0x1000 + 5 * 32, 12));
+        // A pass bound to records 8 to 15: those are clamped behind it, the others are not.
+        list.shaders_write(0x1000 + 8 * 32, 8 * 32);
+        assert!(list.shaders_wrote_since(0x1000 + 8 * 32, 12));
+        assert!(list.shaders_wrote_since(0x1000 + 15 * 32, 12));
+        assert!(list.shaders_wrote_since(0x1000 + 7 * 32 + 24, 12), "a record that reaches into the range");
+        assert!(!list.shaders_wrote_since(0x1000 + 7 * 32, 12));
+        assert!(!list.shaders_wrote_since(0x1000 + 16 * 32, 12));
+        // The batch opened for one of them begins with nothing declared.
+        list.batch_opened();
+        assert!(!list.shaders_wrote_since(0x1000 + 8 * 32, 12));
+        // A reset list has neither.
+        list.shaders_write(0x1000, 64);
+        list.close();
+        list.reset();
+        assert!(!list.shaders_wrote(0x1000, 64));
+        assert!(!list.shaders_wrote_since(0x1000, 64));
     }
 
     /// The ranges a list's shaders may write are joined where they meet, and a record is

@@ -3880,8 +3880,8 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
-        // (For indirect batches that end by what was written, `LEONIDA_INDIRECT_BATCH=3`: the
-        // list keeps every range its shaders may write, whatever is done about copying it back.)
+        // (For indirect batches that end by what was written, `LEONIDA_INDIRECT_BATCH=3` and `4`:
+        // the list keeps every range its shaders may write, whatever is done about copying it back.)
         if crate::draw::batch_spans() {
             list.shaders_write(address, len.min(self.left(address)));
         }
