@@ -11,6 +11,7 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <new>
 #include <string>
 #include <thread>
 #include <vector>
@@ -19,6 +20,7 @@
 #include "../src/bcpack.h"
 #include "../src/bcpack_stream.h"
 #include "../src/dstorage_hold.h"
+#include "../src/dstorage_swizzle.h"
 #include "../src/title_geometry_watch.h"
 #include "../src/title_page_watch.h"
 #include "xmem.h"
@@ -29,6 +31,22 @@
 
 using namespace dsx;
 namespace fs = std::filesystem;
+
+// Counts the blocks of at least g_large_from bytes allocated while g_count_large is set, for test_reused_buffers.
+std::atomic<bool> g_count_large{false};
+std::atomic<size_t> g_large_from{SIZE_MAX};
+std::atomic<int> g_large_blocks{0};
+void* operator new(std::size_t size) {
+    if (g_count_large.load(std::memory_order_relaxed) && size >= g_large_from.load(std::memory_order_relaxed))
+        g_large_blocks.fetch_add(1, std::memory_order_relaxed);
+    if (void* p = std::malloc(size ? size : 1)) return p;
+    throw std::bad_alloc();
+}
+void* operator new[](std::size_t size) { return operator new(size); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
 
 namespace {
 
@@ -1360,6 +1378,119 @@ void test_zlib(Env& env) {
     f->Release();
 }
 
+// A zlib stream of one final fixed-Huffman block (RFC 1951 3.2.6) for test_reused_buffers: each 4 KiB page of its
+// output is 1,024 bytes of pattern() given as literals, then three more copies of them as matches 1,024 bytes back.
+// Every page differs, so a swizzle that moves pages shows, and the stream is a little over a quarter of its output.
+struct ReusedBuffersStream {
+    std::vector<uint8_t> zlib, plain;
+};
+ReusedBuffersStream paged_zlib_stream(size_t pages) {
+    struct Bits {
+        std::vector<uint8_t> out;
+        uint32_t acc = 0;
+        int n = 0;
+        void put(uint32_t v, int bits) {  // a field: least significant bit first
+            acc |= v << n;
+            n += bits;
+            for (; n >= 8; n -= 8, acc >>= 8) out.push_back(static_cast<uint8_t>(acc));
+        }
+        void code(uint32_t c, int bits) {  // a Huffman code: most significant bit first
+            uint32_t r = 0;
+            for (int i = 0; i < bits; ++i) r |= ((c >> i) & 1) << (bits - 1 - i);
+            put(r, bits);
+        }
+        void symbol(unsigned s) {
+            if (s < 144) code(0x30 + s, 8);
+            else if (s < 256) code(0x190 + s - 144, 9);
+            else if (s < 280) code(s - 256, 7);
+            else code(0xc0 + s - 280, 8);
+        }
+    };
+    static constexpr uint16_t length_base[29] = {3,  4,  5,  6,  7,  8,  9,  10, 11,  13,  15,  17,  19,  23, 27,
+                                                 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+    static constexpr uint8_t length_extra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2,
+                                                 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+    static constexpr uint16_t distance_base[30] = {1,   2,   3,   4,   5,   7,    9,    13,   17,   25,
+                                                   33,  49,  65,  97,  129, 193,  257,  385,  513,  769,
+                                                   1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
+    static constexpr uint8_t distance_extra[30] = {0, 0, 0, 0, 1, 1, 2, 2,  3,  3,  4,  4,  5,  5,  6,
+                                                   6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+    ReusedBuffersStream s;
+    Bits w;
+    w.put(1, 1);  // BFINAL
+    w.put(1, 2);  // BTYPE 01: fixed Huffman codes
+    for (size_t p = 0; p < pages; ++p) {
+        const auto literals = pattern(1024, static_cast<uint32_t>(100 + p));
+        for (const uint8_t x : literals) w.symbol(x);
+        for (int copy = 0; copy < 4; ++copy) s.plain.insert(s.plain.end(), literals.begin(), literals.end());
+        for (unsigned left = 3072; left;) {
+            const unsigned length = left <= 258 ? left : left - 258 >= 3 ? 258 : left - 3;  // never leave 1 or 2
+            unsigned i = 28;
+            while (length_base[i] > length || (i == 28 && length != 258)) --i;
+            w.symbol(257 + i);
+            w.put(length - length_base[i], length_extra[i]);
+            unsigned d = 29;
+            while (distance_base[d] > 1024) --d;
+            w.code(d, 5);
+            w.put(1024 - distance_base[d], distance_extra[d]);
+            left -= length;
+        }
+    }
+    w.symbol(256);
+    if (w.n) w.put(0, 8 - w.n);
+    s.zlib = {0x78, 0x01};
+    s.zlib.insert(s.zlib.end(), w.out.begin(), w.out.end());
+    const uint32_t check = adler32(s.plain);
+    for (int shift = 24; shift >= 0; shift -= 8) s.zlib.push_back(static_cast<uint8_t>(check >> shift));
+    return s;
+}
+
+// A queue's worker keeps its staging buffers from one request to the next. 100 identical zlib + swizzle requests of
+// 512 KiB from a file each need three buffers of 128 KiB or more (the compressed source, the inflated bytes and the
+// unshuffled ones): new ones for every request used to be 300 blocks, now each of the worker's two sets of buffers
+// (its own and its paired helper's) allocates them once. Every destination still gets the bytes the stages give.
+void test_reused_buffers(Env& env) {
+    constexpr size_t kPages = 128, kBytes = kPages * 4096;
+    constexpr int kRequests = 100;
+    const auto stream = paged_zlib_stream(kPages);
+    check(stream.plain.size() == kBytes && stream.zlib.size() > 128 * 1024 && stream.zlib.size() < kBytes,
+          "the paged zlib stream has its sizes");
+    std::vector<uint8_t> expected(kBytes);
+    check(leonida::dstorage::unshuffle(DSTORAGE_SWIZZLE_MODE_4K_4K_8K, stream.plain, expected) &&
+              expected != stream.plain,
+          "the swizzle moves the stream's pages");
+    write_file(env.game / L"data" / L"paged.bin", stream.zlib);
+
+    IDStorageFileX* f = open(env, L"GAME:\\data\\paged.bin");
+    IDStorageQueueX2* q = make_queue(env, 0x80, false);
+    IDStorageStatusArrayX* s = make_status(env, 1);
+    std::vector<std::vector<uint8_t>> out(kRequests, std::vector<uint8_t>(kBytes, 0xEE));
+    for (auto& o : out) {
+        DSTORAGE_REQUEST r = file_request(f, 0, o.data(), static_cast<uint32_t>(kBytes));
+        r.SourceSize = static_cast<uint32_t>(stream.zlib.size());
+        r.Options.AsUINT64 =
+            options::kZlib | static_cast<uint64_t>(DSTORAGE_SWIZZLE_MODE_4K_4K_8K) << options::kSwizzleShift;
+        q->EnqueueRequest(&r);
+    }
+    q->EnqueueStatus(s, 0);
+    g_large_blocks = 0;
+    g_large_from = 128 * 1024;
+    g_count_large = true;
+    q->Submit();
+    const bool done = wait_complete(s, 0, 60000);
+    g_count_large = false;
+    check(done, "the paged zlib requests complete");
+    check_hr(s->GetHResult(0), S_OK, "the paged zlib requests succeed");
+    check(std::all_of(out.begin(), out.end(), [&](const std::vector<uint8_t>& o) { return o == expected; }),
+          "every paged zlib request writes the inflated, unshuffled bytes");
+    const int blocks = g_large_blocks.load();
+    std::printf("dstorage: %d paged zlib requests allocated %d blocks of 128 KiB or more\n", kRequests, blocks);
+    check(blocks <= 2 * 3, "a queue's worker reuses its staging buffers across requests");
+    s->Release();
+    q->Release();
+    f->Release();
+}
+
 struct Vector {
     unsigned codec;
     std::span<const uint8_t> raw, plain, wrapped;
@@ -1966,6 +2097,7 @@ int main() {
     test_page_reads_wait_for_submit(env);
     test_guarded_destinations(env);
     test_zlib(env);  // after test_stats, whose request totals it would change
+    test_reused_buffers(env);
 
     fs::remove_all(env.root, ec);
     std::printf("dstorage: %d checks, %d failures\n", g_checks, g_failures);
