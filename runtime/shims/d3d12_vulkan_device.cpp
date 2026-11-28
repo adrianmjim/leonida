@@ -7800,6 +7800,34 @@ struct DeviceState {
         if (entry.mirror_storage)
             context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.mirror_storage);
     }
+    // Entries of a placement's views of its shape's shared zero image, forgotten in the prepare of a replay that gave
+    // the placement memory of its own (publish_streamed_texture). Their keys leave the hash table at once, but a replay
+    // in progress may have flushed the table with them already and submit later, and release()'s ticket (the
+    // submissions so far + 1) can meanwhile be taken by a submission that does not wait for that replay's: a Signal on
+    // another queue takes no tracker lock. The views would be destroyed, and the slots given to other views, once that
+    // one completes. They are released instead once every ExecuteCommandLists replay in progress when they were
+    // forgotten has recorded its submissions, as a retired geometry view waits (GeometryViews::kAfterExecutes):
+    // `epoch` is the last replay begun then.
+    struct HeldImageEntry {
+        ImageEntry entry;
+        std::uint64_t epoch;
+    };
+    std::vector<HeldImageEntry> held_image_entries;  // descriptor_mutex
+    std::atomic<bool> held_image_entries_pending{false};
+    // At the end of every replay, its submissions recorded (VulkanContext::set_after_execute); `all` at the device's
+    // end, when no replay is left.
+    void release_held_image_entries(bool all = false) {
+        if (!held_image_entries_pending.load(std::memory_order_acquire)) return;
+        std::lock_guard lock(descriptor_mutex);
+        // Read under the lock, as the entries' epochs are: every entry looked at was held before it.
+        const std::uint64_t oldest = all ? rt::d3d12::GeometryViews::kAfterExecutes : geometry.oldest_execute();
+        std::erase_if(held_image_entries, [&](const HeldImageEntry& held) {
+            if (!all && held.epoch >= oldest) return false;
+            release(held.entry);
+            return true;
+        });
+        held_image_entries_pending.store(!held_image_entries.empty(), std::memory_order_relaxed);
+    }
 
     struct PendingSample {
         Resource* owner = nullptr;
@@ -8149,21 +8177,31 @@ struct DeviceState {
     void forget_image(std::uint64_t address) {
         std::lock_guard lock(descriptor_mutex);
         images_by_address.erase(address);
-        forget_image_views_locked(address);
+        forget_image_views_locked(address, false);  // with its image, which goes after the submissions made so far
     }
-    void forget_image_views_locked(std::uint64_t address) {
+    // `after_executes` (publish_streamed_texture, in a replay's prepare: views of the shared zero image a replay in
+    // progress may still name): the entries are held until those replays have recorded their submissions
+    // (HeldImageEntry).
+    void forget_image_views_locked(std::uint64_t address, bool after_executes = true) {
         if (!bindless) return;
+        // A replay begun after this read flushes the table under descriptor_mutex, without the keys erased below.
+        const std::uint64_t epoch = after_executes ? geometry.execute_epoch() : 0;
+        const auto retire = [&](const ImageEntry& entry) {
+            if (!after_executes) return release(entry);
+            held_image_entries.push_back({entry, epoch});
+            held_image_entries_pending.store(true, std::memory_order_release);
+        };
         const auto [first, last] = image_keys.equal_range(address);
         for (auto it = first; it != last; ++it) {
             const auto entry = image_entries.find(it->second);
             bindless->erase_key(it->second);
-            release(entry->second);
+            retire(entry->second);
             image_entries.erase(entry);
         }
         image_keys.erase(first, last);
         std::erase_if(replaced_images, [&](const ImageEntry& entry) {
             if (entry.address != address) return false;
-            release(entry);
+            retire(entry);
             return true;
         });
     }
@@ -15313,7 +15351,10 @@ public:
         }
         if (async_texture_refresh()) start_title_filler();
         state_.setup_console_heap_gpu(get_device);  // LEONIDA_CONSOLE_HEAP_GPU: the context's prelude
-        state_.context->set_after_execute([this] { state_.geometry_execute_end(); });
+        state_.context->set_after_execute([this] {
+            state_.geometry_execute_end();
+            state_.release_held_image_entries();  // those this replay was the last one in progress for
+        });
         state_.context->set_before_execute([this] {
             namespace phases = leonida::submit_phases;
             // LEONIDA_REFRESH_PER_FRAME (for runs that only need the title to go on): 1 = the slot-133 shadows, title
@@ -16134,6 +16175,8 @@ public:
                 leonida::title_va_aliases().remove(window.start, window.shader_va);
             state_.title_windows.clear();
         }
+        // No replay is left. Before the shared images go, so their views are deleted first.
+        if (state_.context) state_.release_held_image_entries(true);
         for (auto& [shape, image] : state_.zero_images) if (image) image->Release();
         state_.zero_images.clear();
         if (state_.context) {

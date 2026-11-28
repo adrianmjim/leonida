@@ -3283,6 +3283,15 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_a8_dimensions COMMAND d3d12_a8_dimensions_test)
     set_tests_properties(d3d12_a8_dimensions PROPERTIES SKIP_RETURN_CODE 77)  # no Vulkan GPU, or Wine
 
+    # The views of a placed BC texture's shared zero image, forgotten when a copy gives it memory of its own, outlive
+    # the replays in progress then (RT-ZERO-VIEWS-AFTER-EXECUTES).
+    add_executable(d3d12_zero_view_release_test test/d3d12_zero_view_release_test.cpp)
+    target_link_libraries(d3d12_zero_view_release_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_zero_view_release_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_zero_view_release_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_zero_view_release COMMAND d3d12_zero_view_release_test)
+    set_tests_properties(d3d12_zero_view_release PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
     # ArraySize -1 in array RTVs and DSVs (every slice from the first on), against the host on the same adapter
     # and WARP.
     add_executable(d3d12_view_slices_test test/d3d12_view_slices_test.cpp)
