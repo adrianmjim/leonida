@@ -114,10 +114,13 @@ $settings = @{
     LEONIDA_JOIN_COPIES = '1'; LEONIDA_INDIRECT_WINDOW = '1'; LEONIDA_RELAY_COPY = '1'
     # Copy-backs caught half-written are fetched again (torn.rs).
     LEONIDA_FETCH_CHECK = '1'
-    # Leonida: indirect batches end at every dispatch (INDIRECT_BATCH=1, not 2). With 2 a batch opened before the
-    # title's culling and tessellation dispatches clamped their arguments before they were written: the sea's surface
-    # and its tiled resolve went missing for a frame (sand or black blocks), 6 times in 271 frames; with 1, none in 441.
-    LEONIDA_INDIRECT_BATCH = '1'; LEONIDA_MAP_THREADS = '1'; LEONIDA_TITLE_PRIORITIES = '0'
+    # Leonida: an indirect batch stays open past a program only if all it can store goes through views its bind
+    # declares, and a record one was bound to since the batch's pass is clamped again behind it (INDIRECT_BATCH=4;
+    # 1 ended a batch at every storing program; 2, ending only at waits and draws, clamped the culling passes'
+    # arguments before they were written: the sea's surface missing for a frame). Waterside save, 1440p, RTX 4060 Ti
+    # (2026-11-28), in turns of 4 s against 1: standing -2.15 ms a frame (+-0.39, of 60 to 82; 2: -3.77), walking
+    # -1.6 (+-1.6); 900 to 1,000 batch passes a frame against 1,150. No sea fault found in 1,116 recorded frames.
+    LEONIDA_INDIRECT_BATCH = '4'; LEONIDA_MAP_THREADS = '1'; LEONIDA_TITLE_PRIORITIES = '0'
     # Leonida: the card is not kept awake between submissions (it was '1': a small compute loop that keeps the
     # card's clocks up while it stands idle between submissions, host\awake.rs). Switched in turns of 4 s (LEONIDA_AB)
     # from one save, Series X, RTX 4060 Ti, Ryzen 5 7600X (2026-11-28), the frame with the loop against without:
