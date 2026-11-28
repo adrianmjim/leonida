@@ -368,6 +368,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // As the title's reset does: what the list kept for its commands
         // goes, its allocators stay.
         host.reset();
+        host.idle_trim();
         let bytes = host.scratch_kept();
         let now = crate::host::now_ms();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
@@ -2898,6 +2899,65 @@ mod tests {
         // (Exactly that old is not yet stale; the one just put by never is.)
         assert_eq!(stale([10_000, 40_000].into_iter(), 40_000, 30_000), 0);
         assert_eq!(stale(std::iter::empty(), 40_000, 30_000), 0);
+    }
+
+    /// A host list put by in the idle pool lets go of an indirect scratch
+    /// buffer past 1 MiB, which it kept for whichever title list took it
+    /// next; a smaller one it keeps.
+    #[cfg(windows)]
+    #[test]
+    fn an_idle_list_lets_go_of_a_large_indirect_scratch() {
+        use windows::core::Interface;
+        let Some(host) = crate::host::host() else {
+            eprintln!("no D3D12 device; idle host lists not tested");
+            return;
+        };
+        // SAFETY: a live buffer.
+        let width = |buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource| unsafe { buffer.GetDesc() }.Width;
+        // Through the pool and back. Other tests give lists to it and take
+        // them too: ours is among the last given, unless one took it. The
+        // lists taken out above ours go back in their order, so a test that
+        // expects its own list back still finds it. Only the pool's
+        // functions are used: its layout is not the same on every branch.
+        let detached = |host| Detached { host, _uploads: Vec::new(), _state: Default::default() };
+        let round_trip = |list: crate::host::HostList| {
+            let raw = list.list.as_raw();
+            list.close();
+            recycle(vec![detached(list)], &[0]);
+            let mut others = Vec::new();
+            let mut ours = None;
+            for _ in 0..16 {
+                let Some(l) = fresh_list() else { break };
+                if l.list.as_raw() == raw {
+                    ours = Some(l);
+                    break;
+                }
+                l.close();
+                others.push(detached(l));
+            }
+            others.reverse();
+            let all: Vec<usize> = (0..others.len()).collect();
+            recycle(others, &all);
+            ours
+        };
+        let list = host.new_list().unwrap();
+        assert_eq!(width(&list.indirect_scratch(1).unwrap()), 64 << 10);
+        let large = list.indirect_scratch(2 << 20).unwrap();
+        assert_eq!(width(&large), 2 << 20);
+        drop(large);
+        let Some(list) = round_trip(list) else {
+            eprintln!("another test took the list from the pool");
+            return;
+        };
+        assert_eq!(width(&list.indirect_scratch(1).unwrap()), 64 << 10, "the large buffer was let go");
+        // One within the bound stays with the list.
+        let kept = list.indirect_scratch(1 << 20).unwrap().as_raw();
+        let Some(list) = round_trip(list) else {
+            eprintln!("another test took the list from the pool");
+            return;
+        };
+        assert_eq!(list.indirect_scratch(1).unwrap().as_raw(), kept, "1 MiB is kept");
+        list.close();
     }
 
     /// After edsuuu/VI-BR-PORT 7377418.
