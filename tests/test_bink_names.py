@@ -64,6 +64,16 @@ class TestListOrder(unittest.TestCase):
         # duplicates collapse case-insensitively; '_' (0x5F) sorts before 'e' (0x65)
         self.assertEqual(got, ["Aa/clip_x.bk2", "aa/clipe.bk2", "mm/one.bk2", "zz/b.bk2"])
 
+    def test_inactive_mount_entries_do_not_shift_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            active = mount_xml(["A.bk2", "C.bk2"])
+            tag = "<filename>$(common)/movies/B.bk2</filename>"
+            for ignored in ("<!--\n" + tag + "\n-->", "<![CDATA[" + tag + "]]>", "<?note " + tag + "?>"):
+                with self.subTest(ignored=ignored):
+                    xml = active.replace("<filesToEnable>", "<filesToEnable>" + ignored)
+                    path = self.write(tmp, "list.xml", xml)
+                    self.assertEqual(names_mod.read_mount_lists([path]), ["A.bk2", "C.bk2"])
+
     def test_name_without_extension_compared(self):
         # "ab" is a prefix of "ab-1", so it sorts first; with the extension '-' (0x2D) < '.' (0x2E) would flip them
         self.assertEqual(sorted(["f/ab-1.bk2", "f/ab.bk2"], key=names_mod.sort_key), ["f/ab.bk2", "f/ab-1.bk2"])
