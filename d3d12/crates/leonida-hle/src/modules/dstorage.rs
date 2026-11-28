@@ -145,16 +145,16 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
-    let kept = name.clone();
+    // Only the stream log needs the path once the file object owns it.
+    let logged = stream_log::on().then(|| name.clone());
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let files = Files::new(file, Io::chosen());
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files, name: kept.clone() });
-    if stream_log::on() {
-        stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files, name });
+    if let Some(name) = logged {
+        stream_log::line(format_args!("F\t{:x}\t{name}", file as usize));
     }
-    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
     put(out, file)
 }
 
@@ -662,9 +662,24 @@ fn walls_trace() -> u8 {
     })
 }
 
-/// The files opened, by the address of our file object, with their paths
-/// (for the walls trace: a request names its file by that address).
-static WALLS_FILES: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
+/// What the walls trace calls a request's source: the path its file object
+/// was opened by. Read from the object itself, not from a table of the files
+/// opened by address: such a table kept every path for the whole run, trace
+/// or not, and named a reused address by the file released before it.
+fn walls_source(request: &Request) -> String {
+    if request.options & MEMORY_SOURCE != 0 {
+        return "memory".to_string();
+    }
+    // Other option bits (a source in physical pages, say) mean the source is
+    // not our file object; `execute` turns those requests down without
+    // touching it, and the trace exists to report exactly those failures.
+    if request.source.is_null() || request.options & !(ZLIB | BCPACK | PAGE_DESTINATION) != 0 {
+        return "?".to_string();
+    }
+    // SAFETY: a file object we created; the title keeps it open until the
+    // request completes, and this runs before its status entry is written.
+    unsafe { &*request.source.cast::<Instance<File>>() }.state.name.clone()
+}
 
 /// The walls trace's line for a request that is done.
 fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::time::Instant) {
@@ -672,13 +687,7 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
     if level == 0 || (level == 1 && result.is_ok()) {
         return;
     }
-    let file = if request.options & MEMORY_SOURCE != 0 {
-        "memory".to_string()
-    } else {
-        let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
-        let source = request.source as usize;
-        files.iter().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
-    };
+    let file = walls_source(request);
     let hr = match result {
         Ok(()) => 0,
         Err(hr) => *hr as u32,
@@ -2571,5 +2580,49 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    /// The walls trace names a request's file by the object it reads, so a
+    /// file opened at the address of one released before it is named by its
+    /// own path, and opening and releasing files keeps nothing behind.
+    #[test]
+    fn walls_trace_names_a_reused_file_address_by_its_new_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ["first.bin", "second.bin"].map(|name| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"walls").unwrap();
+            path
+        });
+        let mut addresses = BTreeSet::new();
+        for i in 0..10_000 {
+            let path = &paths[i % 2];
+            let file = open(path);
+            addresses.insert(file as usize);
+            let read = request(0, std::ptr::null_mut(), 5, file, 0, 5);
+            assert_eq!(walls_source(&read), path.to_string_lossy(), "open {i}");
+            let release: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
+            assert_eq!(release(file), 0);
+        }
+        // Files freed one at a time come back at the addresses they left,
+        // which is the case a table by address got wrong.
+        assert!(addresses.len() < 10_000, "no address was reused");
+        let memory = request(MEMORY_SOURCE, std::ptr::null_mut(), 5, b"walls".as_ptr().cast(), 0, 5);
+        assert_eq!(walls_source(&memory), "memory");
+    }
+
+    /// A request with an option `execute` refuses has a source that is not
+    /// our file object, so the walls trace names no file for it rather than
+    /// reading one at that address.
+    #[test]
+    fn walls_trace_reads_no_file_from_a_source_of_another_kind() {
+        // Bit 23 (a source in physical pages) and bit 5 (a further transform);
+        // no file object lives at the source address.
+        let dangling = 0x10 as *const c_void;
+        for option in [1 << 23, 1 << 5] {
+            let read = request(option, std::ptr::null_mut(), 5, dangling, 0, 5);
+            assert_eq!(walls_source(&read), "?", "option {option:#x}");
+            let read = request(option | ZLIB, std::ptr::null_mut(), 5, dangling, 0, 5);
+            assert_eq!(walls_source(&read), "?", "option {option:#x} with zlib");
+        }
     }
 }
