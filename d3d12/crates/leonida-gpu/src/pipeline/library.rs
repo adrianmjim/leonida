@@ -705,39 +705,67 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        tracing::warn!(error = %e, "host pipeline library not saved");
-        return;
-    }
-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
-    // of the library again: run 60's second save).
-    let bytes = {
+    // of the library again: run 60's second save). None: nothing to save.
+    save_in(dir, |tmp| {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
         if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
-            return;
+            return None;
         }
         if added == 0 {
-            0
+            Some(0)
         } else {
             // SAFETY: a plain query.
             let size = unsafe { library.library.GetSerializedSize() };
             let _call = call("serialise", "the whole library");
-            if let Err(e) = serialise(&library.library, &tmp, size) {
+            if let Err(e) = serialise(&library.library, tmp, size) {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
-                let _ = std::fs::remove_file(&tmp);
-                return;
+                let _ = std::fs::remove_file(tmp);
+                return None;
             }
             library.added.store(0, Ordering::Relaxed);
             SAVED.store(size as u64, Ordering::Relaxed);
-            size
+            Some(size)
         }
-    };
+    });
+}
+
+/// One save into `dir`: `serialised` writes the library to the file it is
+/// given (its bytes; 0: none added, only the lists are written; None:
+/// nothing to save), then the library takes the old one's place with its
+/// fingerprint, then the slow and early lists are written. The result,
+/// unless there was nothing to save.
+///
+/// Saves never overlap, from the first byte serialised to the early list:
+/// they share the file the library is serialised to. A worker save that
+/// had serialised and was renaming that file into place while the
+/// shutdown save truncated and refilled it (the shutdown save's own lock
+/// on the library is free once the worker's serialisation ends) renamed a
+/// library still being written, under its fingerprint; the shutdown save
+/// then found no file to rename, failed, and wrote neither list. One lock
+/// for the whole save rather than a file of its own for each: two saves
+/// cannot then rename in the other order (an older library over a newer
+/// one), and nothing is left to clean up. Taken after the `SAVE_EVERY`
+/// check, so a worker that finds a save running returns there instead of
+/// waiting for it; no caller of [`save`] holds a lock, and no lock taken
+/// inside is held by anyone who saves, so it cannot deadlock.
+fn save_in(
+    dir: &std::path::Path,
+    serialised: impl FnOnce(&std::path::Path) -> Option<usize>,
+) -> Option<std::io::Result<usize>> {
+    static SAVING: Mutex<()> = Mutex::new(());
+    let _whole = SAVING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!(error = %e, "host pipeline library not saved");
+        return Some(Err(e));
+    }
+    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+    let bytes = serialised(&tmp)?;
     // Through `used`: a process that asked for none yet (`leonida shaders`)
     // must not write the earlier runs' list over with nothing.
     let used: Vec<String> = used().iter().flatten().cloned().collect();
@@ -760,7 +788,7 @@ pub(crate) fn save(now: bool) {
     let written = library_written
         .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes()))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
-    match written {
+    match &written {
         Ok(()) => tracing::info!(
             bytes,
             early = used.len(),
@@ -771,6 +799,7 @@ pub(crate) fn save(now: bool) {
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
     }
+    Some(written.map(|()| bytes))
 }
 
 /// Writes the library's `size` serialised bytes to the file `tmp`: through
@@ -809,13 +838,10 @@ fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Res
 /// written after: a save cut short in between leaves a library with no
 /// fingerprint, which the next start does not open. Written first, a crash
 /// before the rename would leave the old library under this fingerprint,
-/// and every later save would keep its stale pipelines.
+/// and every later save would keep its stale pipelines. Saves never overlap
+/// ([`save_in`]): one could delete the fingerprint the other just wrote and
+/// then fail its rename.
 fn replace_library_for(dir: &std::path::Path, tmp: &std::path::Path, current: &str) -> std::io::Result<()> {
-    // A worker save and the shutdown save may overlap: one could delete the
-    // fingerprint the other just wrote and then fail its rename, and the
-    // next start would compile everything again.
-    static REPLACING: Mutex<()> = Mutex::new(());
-    let _guard = REPLACING.lock().unwrap_or_else(|e| e.into_inner());
     let noted = dir.join(FINGERPRINT_FILE);
     let same = reuse_blob(std::fs::read_to_string(&noted).ok().as_deref(), current);
     if !same {
@@ -1070,6 +1096,56 @@ mod tests {
         // library on disk is opened by neither the old shaders nor these.
         replace_library_for(dir.path(), &tmp, "other shaders").unwrap_err();
         assert!(!noted.exists());
+    }
+
+    /// A worker save and the shutdown save overlapping: the second starts
+    /// once the first has serialised its library and not yet renamed it into
+    /// place. Both succeed, and what is left is the second's whole library
+    /// under this run's fingerprint, with the lists. (With only the
+    /// serialisation and the rename locked, the second refilled the file the
+    /// first then renamed, and the first failed its own rename and wrote no
+    /// list.)
+    #[test]
+    fn overlapping_saves_leave_one_whole_library_and_its_lists() {
+        const LEN: usize = 1 << 20;
+        // Worked out once, first: in the second save it may outlast the gap.
+        let current = shaders();
+        let dir = tempfile::tempdir().unwrap();
+        let library = dir.path().join(LIBRARY_FILE);
+        std::fs::write(&library, b"a library of other shaders").unwrap();
+        std::fs::write(dir.path().join(FINGERPRINT_FILE), "old shaders").unwrap();
+        // Serialises a library of `LEN` bytes of `byte`, as `serialise` does.
+        fn fill(tmp: &std::path::Path, byte: u8) -> Option<usize> {
+            match Mapped::create(tmp, LEN) {
+                Some(mut file) => file.bytes_mut().fill(byte),
+                None => std::fs::write(tmp, vec![byte; LEN]).unwrap(),
+            }
+            Some(LEN)
+        }
+        let (serialised, gap) = std::sync::mpsc::channel();
+        let first = {
+            let dir = dir.path().to_owned();
+            std::thread::spawn(move || {
+                save_in(&dir, |tmp| {
+                    let bytes = fill(tmp, 1);
+                    serialised.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    bytes
+                })
+            })
+        };
+        gap.recv().unwrap();
+        let second = save_in(dir.path(), |tmp| fill(tmp, 2));
+        let first = first.join().unwrap();
+        assert_eq!(first.unwrap().unwrap(), LEN);
+        assert_eq!(second.unwrap().unwrap(), LEN);
+        let saved = std::fs::read(&library).unwrap();
+        assert_eq!(saved.len(), LEN);
+        assert!(saved.iter().all(|&b| b == 2), "the second save's library, whole");
+        assert_eq!(std::fs::read_to_string(dir.path().join(FINGERPRINT_FILE)).unwrap(), current);
+        assert!(dir.path().join(SLOW_FILE).exists() && dir.path().join(EARLY_FILE).exists());
+        assert!(!library.with_extension("tmp").exists());
+        assert!(!dir.path().join(NEXT_FILE).exists());
     }
 
     /// The bytes at `at` of the pattern the test below writes.
