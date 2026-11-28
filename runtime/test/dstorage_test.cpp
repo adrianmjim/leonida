@@ -32,14 +32,18 @@
 using namespace dsx;
 namespace fs = std::filesystem;
 
-// Counts the blocks of at least g_large_from bytes allocated while g_count_large is set, for test_reused_buffers and
-// test_kept_buffers_cap.
+// Counts the blocks of at least g_large_from bytes allocated while g_count_large is set, for test_reused_buffers,
+// test_kept_buffers_cap and test_kept_buffers_pair_cap, and records the thread that allocated each of the first ones.
 std::atomic<bool> g_count_large{false};
 std::atomic<size_t> g_large_from{SIZE_MAX};
 std::atomic<int> g_large_blocks{0};
+constexpr int kLargeThreads = 16;
+std::atomic<DWORD> g_large_threads[kLargeThreads]{};
 void* operator new(std::size_t size) {
-    if (g_count_large.load(std::memory_order_relaxed) && size >= g_large_from.load(std::memory_order_relaxed))
-        g_large_blocks.fetch_add(1, std::memory_order_relaxed);
+    if (g_count_large.load(std::memory_order_relaxed) && size >= g_large_from.load(std::memory_order_relaxed)) {
+        const int i = g_large_blocks.fetch_add(1, std::memory_order_relaxed);
+        if (i < kLargeThreads) g_large_threads[i].store(GetCurrentThreadId(), std::memory_order_relaxed);
+    }
     if (void* p = std::malloc(size ? size : 1)) return p;
     throw std::bad_alloc();
 }
@@ -1556,6 +1560,72 @@ void test_kept_buffers_cap(Env& env) {
     f->Release();
 }
 
+// The cap holds for both of a worker's sets together. A zlib request inflating 8 MiB from 2.2 MiB (A) and one
+// inflating 6 MiB from 1.7 MiB (B), submitted together, pair: each stages at most 16 MiB, so A runs on the worker
+// with its own set while B is prepared on a pool thread with the helper's set, and their blocks of 2 MiB or more
+// come from two threads. After them the two sets hold 17.9 MiB, each under 16 MiB: the worker gives up A's 8 MiB
+// output buffer and keeps 9.9 MiB. A alone then allocates two blocks: its source again (it would have reused the
+// dropped buffer) and its output (the kept source buffer is too small). With each set trimmed apart, nothing was
+// dropped and A alone allocates only its output.
+void test_kept_buffers_pair_cap(Env& env) {
+    constexpr size_t kLarge = 2u << 20;
+    constexpr uint64_t kCap = 16ull << 20;
+    const auto a = paged_zlib_stream(2048, 1100), b = paged_zlib_stream(1536, 1300);
+    check(a.plain.size() + a.zlib.size() <= kCap && b.plain.size() + b.zlib.size() <= kCap &&
+              a.plain.size() > b.plain.size() && b.plain.size() > a.zlib.size() && a.zlib.size() >= kLarge &&
+              b.zlib.size() < kLarge && a.zlib.size() + b.plain.size() + b.zlib.size() <= kCap &&
+              a.plain.size() + a.zlib.size() + b.plain.size() + b.zlib.size() > kCap,
+          "the paired zlib streams have their sizes");
+    std::vector<uint8_t> file = a.zlib;
+    file.resize((file.size() + 15) / 16 * 16);  // zlib file offsets are 16-byte aligned
+    const size_t b_offset = file.size();
+    file.insert(file.end(), b.zlib.begin(), b.zlib.end());
+    write_file(env.game / L"data" / L"paired.bin", file);
+
+    IDStorageFileX* f = open(env, L"GAME:\\data\\paired.bin");
+    IDStorageQueueX2* q = make_queue(env, 0x80, false);
+    IDStorageStatusArrayX* s = make_status(env, 2);
+    std::vector<uint8_t> out[3] = {std::vector<uint8_t>(a.plain.size(), 0xEE),
+                                   std::vector<uint8_t>(b.plain.size(), 0xEE),
+                                   std::vector<uint8_t>(a.plain.size(), 0xEE)};
+    const auto enqueue = [&](const ReusedBuffersStream& stream, size_t offset, std::vector<uint8_t>& dest) {
+        DSTORAGE_REQUEST r = file_request(f, offset, dest.data(), static_cast<uint32_t>(stream.plain.size()));
+        r.SourceSize = static_cast<uint32_t>(stream.zlib.size());
+        r.Options.AsUINT64 = options::kZlib;
+        q->EnqueueRequest(&r);
+    };
+    int blocks[2]{};
+    std::vector<DWORD> threads;
+    g_large_from = kLarge;
+    for (UINT32 round = 0; round < 2; ++round) {
+        enqueue(a, 0, out[round == 0 ? 0 : 2]);
+        if (round == 0) enqueue(b, b_offset, out[1]);
+        q->EnqueueStatus(s, round);
+        g_large_blocks = 0;
+        g_count_large = true;
+        q->Submit();
+        const bool done = wait_complete(s, round, 60000);
+        g_count_large = false;
+        blocks[round] = g_large_blocks.load();
+        if (round == 0)
+            for (int i = 0; i < (std::min)(blocks[0], kLargeThreads); ++i) {
+                const DWORD id = g_large_threads[i].load();
+                if (std::find(threads.begin(), threads.end(), id) == threads.end()) threads.push_back(id);
+            }
+        check(done, "the paired zlib requests complete");
+        check_hr(s->GetHResult(round), S_OK, "the paired zlib requests succeed");
+    }
+    check(out[0] == a.plain && out[1] == b.plain && out[2] == a.plain,
+          "the paired zlib requests write the inflated bytes");
+    std::printf("dstorage: paired zlib requests allocated %d blocks of 2 MiB or more on %zu threads, then %d alone\n",
+                blocks[0], threads.size(), blocks[1]);
+    check(threads.size() == 2, "the two zlib requests pair: the helper's runs on a pool thread");
+    check(blocks[1] == 2, "a worker keeps at most its cap of both its sets together between requests");
+    s->Release();
+    q->Release();
+    f->Release();
+}
+
 struct Vector {
     unsigned codec;
     std::span<const uint8_t> raw, plain, wrapped;
@@ -2164,6 +2234,7 @@ int main() {
     test_zlib(env);  // after test_stats, whose request totals it would change
     test_reused_buffers(env);
     test_kept_buffers_cap(env);
+    test_kept_buffers_pair_cap(env);
 
     fs::remove_all(env.root, ec);
     std::printf("dstorage: %d checks, %d failures\n", g_checks, g_failures);
